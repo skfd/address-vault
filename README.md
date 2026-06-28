@@ -85,9 +85,15 @@ pip install -e .            # or .[shapefile] for pyshp/pyproj-backed sources
 pytest                      # restic lifecycle test is skipped if restic is absent
 ```
 
-## Not yet done (follow-up)
+## Consumers
 
-Rewiring `address-layerist` and `ontario-address-changes` to consume the vault
-(via `import addressvault`) instead of pulling city sites directly, and removing
-`address-layerist`'s in-engine `cache.py`. This repo ships the standalone vault
-first; the consumer cutover is a deliberate second step.
+`address-layerist` and `ontario-address-changes` both consume the vault via
+`import addressvault` (each declares it as a dependency): their `fetch` step calls
+`Vault().pull(slug)` and the rest read it back with `Vault().path(slug, "latest")`.
+Neither pulls city sites directly any more, and `address-layerist`'s old in-engine
+`cache.py` has been removed.
+
+The vault has no scheduler process of its own here: it is fed as a side effect of
+the consumers' own daily `update` jobs (each calls `pull()`). `sweep` (aging hot
+days into the cold tier) and `recool` only run if you also schedule
+`addressvault pull-due` or `addressvault sweep` — see **Scheduling** above.
