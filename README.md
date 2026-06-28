@@ -87,13 +87,17 @@ pytest                      # restic lifecycle test is skipped if restic is abse
 
 ## Consumers
 
-`address-layerist` and `ontario-address-changes` both consume the vault via
+`ontario-address-changes` and `toronto-addresses-import` consume the vault via
 `import addressvault` (each declares it as a dependency): their `fetch` step calls
-`Vault().pull(slug)` and the rest read it back with `Vault().path(slug, "latest")`.
-Neither pulls city sites directly any more, and `address-layerist`'s old in-engine
-`cache.py` has been removed.
+`Vault().pull(slug)` and reads it back with `Vault().path(slug, "latest")`.
+
+`address-layerist` deliberately does **not** import `addressvault`: the tile
+engine only slims an input GeoJSON, so it reads the newest `<slug>-DATE.geojson`
+straight from a directory (`$ADDRESSVAULT_DIR` by default) and knows nothing about
+the vault API. Its city tasks pull first, then build:
+`addressvault pull <slug> && python run.py update`.
 
 The vault has no scheduler process of its own here: it is fed as a side effect of
-the consumers' own daily `update` jobs (each calls `pull()`). `sweep` (aging hot
-days into the cold tier) and `recool` only run if you also schedule
-`addressvault pull-due` or `addressvault sweep` — see **Scheduling** above.
+those daily jobs (each does a `pull`). `sweep` (aging hot days into the cold tier)
+and `recool` only run via the scheduled `addressvault sweep` (or `pull-due`) —
+see **Scheduling** above.
