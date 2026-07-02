@@ -5,6 +5,12 @@ the scheduler does the occasional short write. A snapshot's tier is two
 independent booleans -- ``on_disk`` (a hot copy exists) and ``archived`` (present
 in restic, true forever once swept) -- because a thaw *copies* out of the archive,
 so a day can be both at once.
+
+The ``leases`` table is the cross-process gate: one row per slug, claimed with a
+``BEGIN IMMEDIATE`` transaction so that among many consumer processes only one
+writes a given city at a time. The rest read the row to report progress. The
+connection runs in autocommit mode (``isolation_level=None``) so that explicit
+transaction is honoured exactly.
 """
 
 import json
@@ -33,7 +39,14 @@ CREATE TABLE IF NOT EXISTS jobs(
   id TEXT PRIMARY KEY, kind TEXT, slug TEXT, date TEXT, state TEXT, detail TEXT,
   created_at TEXT, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS leases(
+  slug TEXT PRIMARY KEY, kind TEXT, state TEXT, holder TEXT, date TEXT, detail TEXT,
+  started_at TEXT, updated_at TEXT
+);
 """
+
+# A lease is "done"/"failed" once its writer finishes; any other state is live.
+_TERMINAL_STATES = ("done", "failed")
 
 _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",
@@ -49,12 +62,13 @@ def _now():
 class Catalog:
     def __init__(self, db_path):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
+        # autocommit: each write is its own transaction, and the explicit
+        # BEGIN IMMEDIATE in acquire_lease is the only multi-statement one.
+        self.conn = sqlite3.connect(db_path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
-        self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -158,6 +172,48 @@ class Catalog:
             (uuid.uuid4().hex, kind, slug, date, state, detail, now, now),
         )
         self.conn.commit()
+
+    # --- leases (the per-slug single-writer gate) ---
+    def acquire_lease(self, slug, kind, date, holder, ttl_seconds, state):
+        """Atomically claim the write lease for ``slug``. Returns True if this
+        caller now holds it. A row that is terminal (done/failed) or stale (no
+        state change within ``ttl_seconds``, i.e. its holder likely died) is
+        reclaimable; a live, fresh row is not."""
+        now = datetime.now(timezone.utc)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:  # another process holds the write lock
+            return False
+        try:
+            row = self.conn.execute(
+                "SELECT state, updated_at FROM leases WHERE slug=?", (slug,)
+            ).fetchone()
+            if row is not None and row["state"] not in _TERMINAL_STATES:
+                age = (now - datetime.fromisoformat(row["updated_at"])).total_seconds()
+                if age <= ttl_seconds:
+                    self.conn.execute("COMMIT")
+                    return False
+            now_iso = now.isoformat()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO leases "
+                "(slug, kind, state, holder, date, detail, started_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (slug, kind, state, holder, date, None, now_iso, now_iso),
+            )
+            self.conn.execute("COMMIT")
+            return True
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def set_lease_state(self, slug, state, detail=None):
+        self.conn.execute(
+            "UPDATE leases SET state=?, detail=?, updated_at=? WHERE slug=?",
+            (state, detail, _now(), slug),
+        )
+
+    def get_lease(self, slug):
+        return self.conn.execute("SELECT * FROM leases WHERE slug=?", (slug,)).fetchone()
 
     def stats(self):
         c = self.conn

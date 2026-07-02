@@ -1,11 +1,12 @@
 import os
 import shutil
+import threading
 
 import pytest
 
 from addressvault import archive, config
 from addressvault.sources import Source
-from addressvault.vault import Archived
+from addressvault.vault import Archived, PullInProgress, Vault
 
 from conftest import write_geojson
 
@@ -65,6 +66,109 @@ def test_snapshots_listing_and_tier_filter(vault, http_dir):
     cold = vault.snapshots("t", tier="cold")
     assert [s.date for s in hot] == ["2026-01-01"]
     assert [s.date for s in cold] == ["2026-01-02"]
+
+
+def test_pull_records_terminal_lease_status(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    st = vault.pull_status("t")
+    assert st is not None
+    assert st.kind == "pull" and st.state == "done"
+    assert not st.active
+
+
+def test_concurrent_pull_is_reported_not_restarted(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    # Simulate another live consumer holding the slug's lease mid-fetch.
+    assert vault.cat.acquire_lease("t", "pull", "2026-01-01", "other:1",
+                                   vault.lease_ttl, "fetching")
+    with pytest.raises(PullInProgress) as ei:
+        vault.pull("t", today="2026-01-01")
+    st = ei.value.status
+    assert st.state == "fetching" and st.holder == "other:1" and st.active
+
+
+def test_stale_lease_is_reclaimed(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    # A dead holder's lease that has gone silent past the TTL must not wedge the
+    # city: backdate its last state change well beyond lease_ttl.
+    assert vault.cat.acquire_lease("t", "pull", "2026-01-01", "dead:1",
+                                   vault.lease_ttl, "fetching")
+    vault.cat.conn.execute(
+        "UPDATE leases SET updated_at='2000-01-01T00:00:00+00:00' WHERE slug='t'")
+    snap = vault.pull("t", today="2026-01-01")
+    assert snap.features == 3
+    assert vault.pull_status("t").state == "done"
+
+
+def test_failed_pull_marks_lease_failed(vault):
+    # Unreachable source -> fetch raises -> lease ends "failed" with detail, and
+    # the slug is not left wedged (a later valid pull can reclaim it).
+    vault.add_source(Source(slug="t", provider="T",
+                            data_url="http://127.0.0.1:1/missing.geojson",
+                            access="static", format="geojson"))
+    with pytest.raises(Exception):
+        vault.pull("t", today="2026-01-01")
+    st = vault.pull_status("t")
+    assert st.state == "failed" and st.detail
+
+
+def test_wait_coalesces_onto_holder_result(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)  # a real fetch would record 3 features
+    _add(vault, base)
+    # Another live holder is mid-fetch; it will finish shortly with a distinctive
+    # snapshot (999 features) that a real fetch here would never produce.
+    assert vault.cat.acquire_lease("t", "pull", "2026-01-01", "other:1",
+                                   vault.lease_ttl, "fetching")
+
+    def holder():
+        import time as _t
+        _t.sleep(0.2)
+        v2 = Vault(dir=vault.root)  # separate connection, like another process
+        v2.cat.upsert_snapshot(
+            slug="t", date="2026-01-01", sha256="deadbeef", features=999, bytes=10,
+            src_last_modified=None, src_content_length=None,
+            on_disk=1, archived=0, restored_until=None,
+            unchanged_since=None, fetched_at="2026-01-01T00:00:00+00:00")
+        v2.cat.set_lease_state("t", "done")
+
+    t = threading.Thread(target=holder); t.start()
+    snap = vault.pull("t", today="2026-01-01", wait=True, poll_interval=0.02)
+    t.join()
+    # Coalesced onto the holder's write; did NOT run a second fetch (would be 3).
+    assert snap.features == 999
+
+
+def test_wait_takes_over_failed_holder(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    # A prior holder failed and released a terminal lease -> we must pull ourselves.
+    assert vault.cat.acquire_lease("t", "pull", "2026-01-01", "other:1",
+                                   vault.lease_ttl, "fetching")
+    vault.cat.set_lease_state("t", "failed", detail="boom")
+    snap = vault.pull("t", today="2026-01-01", wait=True, poll_interval=0.02)
+    assert snap.features == 3
+    assert vault.pull_status("t").state == "done"
+
+
+def test_wait_times_out_while_lease_held(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    # A fresh lease that never releases -> wait must give up, not hang.
+    assert vault.cat.acquire_lease("t", "pull", "2026-01-01", "other:1",
+                                   vault.lease_ttl, "fetching")
+    with pytest.raises(TimeoutError):
+        vault.pull("t", today="2026-01-01", wait=True,
+                   poll_interval=0.02, wait_timeout=0.2)
 
 
 @pytest.mark.skipif(not HAS_RESTIC, reason="restic not installed")

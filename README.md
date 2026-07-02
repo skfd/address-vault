@@ -30,6 +30,46 @@ except Archived:
 
 A thin CLI wraps the same calls for cron and humans (`addressvault ...`).
 
+## Concurrency: one writer per city
+
+Consumers are separate processes that each call `pull()`, so the vault gates
+writes with a **per-slug lease** in the catalog (claimed with a `BEGIN IMMEDIATE`
+transaction — SQLite is the cross-process lock). Only one process pulls a given
+city at a time; the rest do **not** start a second fetch. A concurrent
+`pull`/`thaw` of a busy slug raises `PullInProgress`, carrying a coarse
+`PullStatus` (`fetching → writing → done/failed`) to poll:
+
+```python
+from addressvault import Vault, PullInProgress
+
+try:
+    v.pull("toronto")                       # I won the lease: fetch + record
+except PullInProgress as e:
+    while e.status.active:                   # someone else is already pulling it
+        time.sleep(2)
+        e.status = v.pull_status("toronto")  # coarse progress, no second fetch
+    snap = v.snapshot("toronto", "latest")   # read the copy they just wrote
+```
+
+Most consumers just want that coalescing without the loop, so `pull` (and `thaw`)
+take an opt-in `wait`:
+
+```python
+snap = v.pull("toronto", wait=True)          # do it, or block on the in-flight
+                                             # pull and return its result
+```
+
+`wait=True` returns the holder's freshly written `latest` (no second fetch); if
+that holder failed or crashed, it takes over. On the CLI it is `--wait`:
+
+```
+addressvault pull toronto --wait             # coalesce; exits non-zero on timeout
+```
+
+`sweep`/`recool` take the same lease and simply skip a city being written this
+cycle. A crashed holder's lease goes stale after `LEASE_TTL_SECONDS` (30 min) and
+is reclaimed, so a dead process can't wedge a city.
+
 ## Tiers
 
 A snapshot is two independent booleans, because **thaw copies (never moves)** —
@@ -55,6 +95,7 @@ addressvault pull-due                     # pull everything due today, then swee
 addressvault serve [--interval N]         # run the self-scheduler (one writer)
 addressvault snapshots <slug> [--from D --to D --tier hot|cold] [--json]
 addressvault data <slug> [<date>|latest] [-o PATH|-]   # stream bytes; errors with a thaw hint if cold
+addressvault status <slug> [--json]       # progress of an in-flight (or the last) pull
 addressvault thaw <slug> <date> [--ttl-hours N]
 addressvault sweep [--keep-days N]
 addressvault stats [--json]
@@ -62,8 +103,9 @@ addressvault stats [--json]
 
 ## Scheduling
 
-`addressvault serve` is a self-contained loop (the single writer — no restic lock
-races). Or drive it from the OS instead:
+`addressvault serve` is a self-contained loop; the per-slug lease (see
+**Concurrency** above) is what actually prevents pull/restic races, so it is safe
+to run alongside consumers that pull directly. Or drive it from the OS instead:
 
 ```
 addressvault pull-due        # run hourly/daily from cron or Windows Task Scheduler
@@ -89,13 +131,14 @@ pytest                      # restic lifecycle test is skipped if restic is abse
 
 `ontario-address-changes` and `toronto-addresses-import` consume the vault via
 `import addressvault` (each declares it as a dependency): their `fetch` step calls
-`Vault().pull(slug)` and reads it back with `Vault().path(slug, "latest")`.
+`Vault().pull(slug, wait=True)` (coalescing onto any in-flight pull) and reads it
+back with `Vault().path(slug, "latest")`.
 
 `address-layerist` deliberately does **not** import `addressvault`: the tile
 engine only slims an input GeoJSON, so it reads the newest `<slug>-DATE.geojson`
 straight from a directory (`$ADDRESSVAULT_DIR` by default) and knows nothing about
 the vault API. Its city tasks pull first, then build:
-`addressvault pull <slug> && python run.py update`.
+`addressvault pull <slug> --wait && python run.py update`.
 
 The vault has no scheduler process of its own here: it is fed as a side effect of
 those daily jobs (each does a `pull`). `sweep` (aging hot days into the cold tier)

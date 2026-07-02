@@ -7,6 +7,6 @@ forever); thaw copies a cold day back to hot on demand.
 """
 
 from addressvault.sources import Source
-from addressvault.vault import Archived, Snapshot, Vault
+from addressvault.vault import Archived, PullInProgress, PullStatus, Snapshot, Vault
 
-__all__ = ["Vault", "Snapshot", "Source", "Archived"]
+__all__ = ["Vault", "Snapshot", "Source", "Archived", "PullInProgress", "PullStatus"]

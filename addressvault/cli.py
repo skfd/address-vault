@@ -2,11 +2,12 @@
 
     addressvault seed <datasets_dir>                 # import sources from datasets/*.toml
     addressvault sources [--json]
-    addressvault pull <slug> [--force]               # fetch + dedup + record
+    addressvault pull <slug> [--force] [--wait]      # fetch + dedup + record (--wait: coalesce)
     addressvault pull-due                             # pull every source due today, then sweep
     addressvault serve [--interval N]                # run the self-scheduler
     addressvault snapshots <slug> [--from D --to D --tier hot|cold] [--json]
     addressvault data <slug> [<date>|latest] [-o PATH|-]   # stream bytes (thaw-or-error if cold)
+    addressvault status <slug> [--json]              # progress of an in-flight/last pull
     addressvault thaw <slug> <date> [--ttl-hours N]  # copy a cold day back to hot
     addressvault sweep [--keep-days N]               # cool aged hot copies into restic
     addressvault stats [--json]
@@ -19,7 +20,7 @@ import json
 import shutil
 import sys
 
-from addressvault.vault import Archived, Vault
+from addressvault.vault import Archived, PullInProgress, Vault
 
 
 def _print_snap(s):
@@ -43,8 +44,38 @@ def cmd_sources(vault, args):
 
 
 def cmd_pull(vault, args):
-    snap = vault.pull(args.slug, force=args.force)
+    if args.wait:
+        try:
+            snap = vault.pull(args.slug, force=args.force, wait=True)
+        except TimeoutError as e:
+            print(f"  {e}", file=sys.stderr)
+            sys.exit(1)
+        _print_snap(snap)
+        return
+    try:
+        snap = vault.pull(args.slug, force=args.force)
+    except PullInProgress as e:
+        st = e.status
+        print(f"  {st.slug} already {st.kind}ing: {st.state} "
+              f"(holder {st.holder}, since {st.started_at})")
+        print(f"  poll it: addressvault status {st.slug}")
+        return
     _print_snap(snap)
+
+
+def cmd_status(vault, args):
+    st = vault.pull_status(args.slug)
+    if st is None:
+        print(f"  {args.slug}: no write recorded yet")
+        return
+    if args.json:
+        print(json.dumps(st.__dict__, indent=2))
+        return
+    live = "in progress" if st.active else "finished"
+    print(f"  {st.slug} {st.kind} {st.state} ({live})  holder={st.holder}  "
+          f"date={st.date}  updated={st.updated_at}")
+    if st.detail:
+        print(f"  detail: {st.detail}")
 
 
 def cmd_pull_due(vault, args):
@@ -111,7 +142,10 @@ def main(argv=None):
     sub.add_parser("seed").add_argument("datasets_dir")
     sp = sub.add_parser("sources"); sp.add_argument("--json", action="store_true")
 
-    sp = sub.add_parser("pull"); sp.add_argument("slug"); sp.add_argument("--force", action="store_true")
+    sp = sub.add_parser("pull"); sp.add_argument("slug")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--wait", action="store_true",
+                    help="if another process is pulling this slug, wait for it instead of erroring")
     sp = sub.add_parser("pull-due"); sp.add_argument("--keep-days", type=int, default=2)
     sp = sub.add_parser("serve")
     sp.add_argument("--interval", type=int, default=3600); sp.add_argument("--keep-days", type=int, default=2)
@@ -124,6 +158,9 @@ def main(argv=None):
     sp.add_argument("slug"); sp.add_argument("date", nargs="?", default="latest")
     sp.add_argument("-o", "--out", default="-", help="output path, or - for stdout")
 
+    sp = sub.add_parser("status")
+    sp.add_argument("slug"); sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("thaw")
     sp.add_argument("slug"); sp.add_argument("date"); sp.add_argument("--ttl-hours", type=int, default=24)
 
@@ -135,7 +172,8 @@ def main(argv=None):
     handlers = {
         "seed": cmd_seed, "sources": cmd_sources, "pull": cmd_pull,
         "pull-due": cmd_pull_due, "serve": cmd_serve, "snapshots": cmd_snapshots,
-        "data": cmd_data, "thaw": cmd_thaw, "sweep": cmd_sweep, "stats": cmd_stats,
+        "data": cmd_data, "status": cmd_status, "thaw": cmd_thaw,
+        "sweep": cmd_sweep, "stats": cmd_stats,
     }
     handlers[args.command](vault, args)
 
