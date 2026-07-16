@@ -11,6 +11,7 @@
     addressvault thaw <slug> <date> [--ttl-hours N]  # copy a cold day back to hot
     addressvault sweep [--keep-days N]               # cool aged hot copies into restic
     addressvault stats [--json]
+    addressvault report [--out PATH] [--days N]      # write the HTML status report
 
 Set ADDRESSVAULT_DIR (or pass --dir) to the vault folder.
 """
@@ -134,6 +135,12 @@ def cmd_stats(vault, args):
           f"hot={st['hot']} cold={st['cold']} hot_bytes={st['hot_bytes']:,}")
 
 
+def cmd_report(vault, args):
+    from addressvault import report
+    path = report.build(vault, days=args.days, out=args.out)
+    print(f"  wrote {path}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="addressvault", description="Tiered store for raw city dumps")
     p.add_argument("--dir", help="Vault folder (default: ADDRESSVAULT_DIR)")
@@ -166,6 +173,9 @@ def main(argv=None):
 
     sp = sub.add_parser("sweep"); sp.add_argument("--keep-days", type=int, default=2)
     sp = sub.add_parser("stats"); sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("report")
+    sp.add_argument("--out", help="output path (default: <vault>/report.html)")
+    sp.add_argument("--days", type=int, default=42)
 
     args = p.parse_args(argv)
     vault = Vault(dir=args.dir)
@@ -173,7 +183,7 @@ def main(argv=None):
         "seed": cmd_seed, "sources": cmd_sources, "pull": cmd_pull,
         "pull-due": cmd_pull_due, "serve": cmd_serve, "snapshots": cmd_snapshots,
         "data": cmd_data, "status": cmd_status, "thaw": cmd_thaw,
-        "sweep": cmd_sweep, "stats": cmd_stats,
+        "sweep": cmd_sweep, "stats": cmd_stats, "report": cmd_report,
     }
     handlers[args.command](vault, args)
 
