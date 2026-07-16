@@ -7,22 +7,29 @@ from the start every page.
 
 import json
 import os
+import time
 from datetime import date as _date
 
 import requests
 
 TIMEOUT = 120
 DEFAULT_PAGE = 2000
+# maps.ottawa.ca (F5 GSLB) started dropping new TCP connections after ~15-35
+# rapid page requests (observed 2026-07-16); a keep-alive Session stays under
+# that limit. If a fetch still stalls, wait out the observed ~15 min block and
+# resume from last_oid instead of failing the whole city.
+RETRIES = 3
+RETRY_WAIT = 900
 
 
-def _layer_meta(url):
-    r = requests.get(url, params={"f": "json"}, timeout=TIMEOUT)
+def _layer_meta(session, url):
+    r = session.get(url, params={"f": "json"}, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def _query(url, params):
-    r = requests.get(url + "/query", params=params, timeout=TIMEOUT)
+def _query(session, url, params):
+    r = session.get(url + "/query", params=params, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -52,7 +59,8 @@ def fetch(source, dest_dir, *, force=False, today=None):
     filename = f"{source.slug}-{day}.geojson"
     filepath = os.path.join(dest_dir, filename)
 
-    meta = _layer_meta(source.data_url)
+    session = requests.Session()
+    meta = _layer_meta(session, source.data_url)
     page = min(meta.get("maxRecordCount") or DEFAULT_PAGE, DEFAULT_PAGE)
     can_geojson = "geoJSON" in (meta.get("supportedQueryFormats") or "")
     fmt = "geojson" if can_geojson else "json"
@@ -61,13 +69,24 @@ def fetch(source, dest_dir, *, force=False, today=None):
 
     features = []
     last_oid = -1
+    retries = RETRIES
     while True:
         params = {
             "where": f"{oid_field} > {last_oid}", "outFields": "*",
             "outSR": 4326, "f": fmt,
             "orderByFields": oid_field, "resultRecordCount": page,
         }
-        data = _query(source.data_url, params)
+        try:
+            data = _query(session, source.data_url, params)
+        except (requests.ConnectionError, requests.Timeout):
+            if not retries:
+                raise
+            retries -= 1
+            print(f"\n  stalled at {len(features):,} features; "
+                  f"resuming past {oid_field} {last_oid} in {RETRY_WAIT}s")
+            time.sleep(RETRY_WAIT)
+            session = requests.Session()  # a blocked connection won't recover
+            continue
         batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
         if not batch:
             break
