@@ -56,6 +56,18 @@ def test_changed_content_makes_new_snapshot(vault, http_dir):
     assert snap2.tier == "hot"
 
 
+def test_same_day_repeat_pull_is_a_noop(vault, http_dir):
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    write_geojson(d, "addr.geojson", 5)  # remote changes mid-day
+    snap = vault.pull("t", today="2026-01-01")  # rerun of the same day
+    assert snap.features == 3  # short-circuit: no second fetch
+    snap = vault.pull("t", today="2026-01-01", force=True)
+    assert snap.features == 5  # force still refetches
+
+
 def test_snapshots_listing_and_tier_filter(vault, http_dir):
     base, d = http_dir
     write_geojson(d, "addr.geojson", 2)

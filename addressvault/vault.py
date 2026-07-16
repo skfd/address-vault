@@ -200,12 +200,14 @@ class Vault:
     # --- writes ---
     def pull(self, slug, force=False, today=None, *,
              wait=False, poll_interval=2.0, wait_timeout=None):
-        """Fetch + dedup + record today's snapshot. With ``wait=True``, if another
-        caller already holds the slug, block until it finishes and return its
-        freshly written ``latest`` (coalesce, no second fetch) -- regardless of
-        ``force``, since a fresh pull just completed -- or, if that holder failed
-        or crashed, take over. ``wait=False`` (default) raises ``PullInProgress``
-        instead of blocking."""
+        """Fetch + dedup + record today's snapshot. If today's snapshot is
+        already recorded, return it without fetching (daily cadence, same as
+        the scheduler's ``is_due``) unless ``force``. With ``wait=True``, if
+        another caller already holds the slug, block until it finishes and
+        return its freshly written ``latest`` (coalesce, no second fetch) --
+        regardless of ``force``, since a fresh pull just completed -- or, if
+        that holder failed or crashed, take over. ``wait=False`` (default)
+        raises ``PullInProgress`` instead of blocking."""
         deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
         while True:
             try:
@@ -221,6 +223,14 @@ class Vault:
     def _pull_once(self, slug, force, today):
         src = self.source(slug)
         day = today or date.today().isoformat()
+        # Same-day short-circuit: today's snapshot is already recorded, so a
+        # repeat pull (e.g. a rerun of a daily job) is a no-op -- no lease,
+        # no fetch. A concurrent pull that hasn't recorded yet is not caught
+        # here; it surfaces as PullInProgress via the lease below.
+        if not force:
+            row = self.cat.get_snapshot(slug, day)
+            if row:
+                return Snapshot.from_row(row)
         if not self.cat.acquire_lease(slug, "pull", day, _holder(), self.lease_ttl, "fetching"):
             raise PullInProgress(self.pull_status(slug))
         try:
