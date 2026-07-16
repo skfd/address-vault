@@ -238,6 +238,7 @@ class Vault:
         except PullInProgress:
             raise
         except Exception as e:
+            self.cat.record_job("pull", slug, day, "failed", detail=str(e))
             self.cat.set_lease_state(slug, "failed", detail=str(e))
             raise
 

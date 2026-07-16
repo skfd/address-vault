@@ -129,6 +129,12 @@ def test_failed_pull_marks_lease_failed(vault):
         vault.pull("t", today="2026-01-01")
     st = vault.pull_status("t")
     assert st.state == "failed" and st.detail
+    # The failure is also durably logged in jobs (the lease row gets
+    # overwritten by the next attempt; the job log is the history).
+    job = vault.cat.conn.execute(
+        "SELECT * FROM jobs WHERE kind='pull' AND slug='t' AND state='failed'"
+    ).fetchone()
+    assert job is not None and job["detail"]
 
 
 def test_wait_coalesces_onto_holder_result(vault, http_dir):
