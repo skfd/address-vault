@@ -1,19 +1,25 @@
 """Static HTML status report: what the vault holds, per city per day.
 
 ``addressvault report`` renders one self-contained HTML file from the catalog --
-no server, open it in a browser. Three views:
+no server, open it in a browser. Four views:
 
 * a city x day matrix (new data / pulled-but-unchanged / failed / no attempt),
 * a month calendar of per-day totals (the "did the scheduler run" view),
+* storage: real bytes on disk per tier, daily growth, and catalog-vs-disk drift,
 * the failure log (durable ``jobs`` rows plus each city's current lease state).
 
 "Failed" for a past day is only as good as the job log: failures are recorded
 in ``jobs`` from July 2026 on, so older gaps stay ambiguous "no attempt".
+
+Storage numbers come from stat()ing the vault, never from ``restic stats`` --
+the cold figure is therefore the repo's size on disk, not its dedup ratio.
 """
 
 import html
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+from addressvault import archive, config
 
 # Cell states, in legend order.
 NEW, UNCHANGED, FAILED, MISSING = "new", "unchanged", "failed", "missing"
@@ -21,7 +27,7 @@ NEW, UNCHANGED, FAILED, MISSING = "new", "unchanged", "failed", "missing"
 
 def build(vault, days=42, out=None, today=None):
     """Write the report and return its path."""
-    data = _collect(vault.cat, days, today or date.today())
+    data = _collect(vault.cat, vault.root, days, today or date.today())
     out = out or os.path.join(vault.root, "report.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(_render(data))
@@ -30,7 +36,7 @@ def build(vault, days=42, out=None, today=None):
 
 # --- data ---
 
-def _collect(cat, days, today):
+def _collect(cat, root, days, today):
     frm = (today - timedelta(days=days - 1)).isoformat()
     dates = [(today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
     slugs = [r["slug"] for r in cat.list_sources()]
@@ -67,7 +73,89 @@ def _collect(cat, days, today):
         "today": today.isoformat(),
         "dates": dates, "slugs": slugs, "snaps": snaps, "fails": fails,
         "current": current, "log": log, "stats": cat.stats(),
+        "storage": _storage(cat, root, dates),
     }
+
+
+def _storage(cat, root, dates):
+    """What the vault actually occupies, and where the catalog disagrees.
+
+    One walk of the vault root does double duty: it totals bytes per tier and
+    diffs the files it finds against the snapshots the catalog calls hot.
+    """
+    repo = archive._repo(root)  # env override, else <root>/restic
+    expected = {}  # filename -> snapshot row the catalog believes is on disk
+    for r in cat.conn.execute(
+        "SELECT slug, date, bytes, restored_until FROM snapshots WHERE on_disk=1"
+    ):
+        expected[config.snapshot_name(r["slug"], r["date"])] = r
+
+    tiers = {"hot": 0, "cold": _dir_bytes(repo), "catalog": 0, "other": 0}
+    seen, warn = {}, []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if os.path.abspath(dirpath) == os.path.abspath(repo):
+            dirnames[:] = []  # already totalled above (and may live outside root)
+            continue
+        for name in filenames:
+            size = _size(os.path.join(dirpath, name))
+            if size is None:
+                continue
+            if dirpath == root and name.endswith(".geojson"):
+                tiers["hot"] += size
+                seen[name] = size
+            elif dirpath == root and name.startswith(config.DB_NAME):
+                tiers["catalog"] += size  # catalog.db plus its -wal/-shm
+            else:
+                tiers["other"] += size
+
+    for name, row in sorted(expected.items()):
+        if name not in seen:
+            warn.append(f"{name}: catalog says on_disk, file is missing")
+        elif seen[name] != row["bytes"]:
+            warn.append(f"{name}: {_human_bytes(seen[name])} on disk, catalog "
+                        f"recorded {_human_bytes(row['bytes'])}")
+    for name in sorted(set(seen) - set(expected)):
+        warn.append(f"{name}: on disk but not a hot snapshot in the catalog")
+    stale = cat.conn.execute(
+        "SELECT COUNT(*) FROM snapshots WHERE on_disk=1 AND restored_until IS NOT NULL "
+        # same UTC-iso clock recool_expired() compares against
+        "AND restored_until<=?", (datetime.now(timezone.utc).isoformat(),)
+    ).fetchone()[0]
+    if stale:
+        warn.append(f"{stale} thawed snapshot(s) past their TTL still hot -- "
+                    f"recool has not run")
+
+    # Growth = bytes of genuinely new content per day; unchanged days reuse a
+    # file that already exists, so they cost nothing.
+    added = dict.fromkeys(dates, 0)
+    for r in cat.conn.execute(
+        "SELECT date, COALESCE(SUM(bytes),0) AS b FROM snapshots "
+        "WHERE unchanged_since IS NULL AND date>=? GROUP BY date", (dates[0],)
+    ):
+        if r["date"] in added:
+            added[r["date"]] = r["b"]
+
+    total_added = sum(added.values())
+    return {
+        "tiers": tiers, "total": sum(tiers.values()), "warn": warn,
+        "added": added, "added_total": total_added,
+        "per_year": total_added / len(dates) * 365,
+    }
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:  # vanished mid-walk, or unreadable
+        return None
+
+
+def _dir_bytes(path):
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for name in filenames:
+            total += _size(os.path.join(dirpath, name)) or 0
+    return total
 
 
 def _cell(data, slug, d):
@@ -108,6 +196,7 @@ def _render(data):
         _legend(),
         "<h2>Pulls by city and day</h2>", _matrix(data),
         "<h2>Daily totals</h2>", _calendar(data),
+        "<h2>Storage</h2>", _storage_section(data),
         "<h2>Failures</h2>", _failures(data),
         "<div id='tip' hidden></div>", _JS, "</body></html>",
     ]
@@ -206,6 +295,55 @@ def _calendar(data):
     return "".join(out)
 
 
+_TIERS = [("hot", "hot files"), ("cold", "restic repo"),
+          ("catalog", "catalog"), ("other", "other")]
+
+
+def _storage_section(data):
+    st = data["storage"]
+    total = st["total"]
+    out = [f"<p class='sub'>{_human_bytes(total)} on disk under the vault root.</p>",
+           "<div class='tiers'>"]
+    for key, label in _TIERS:
+        v = st["tiers"][key]
+        pct = (v / total * 100) if total else 0
+        out.append(f"<i class='{key}' style='flex:{v or 0.0001}' "
+                   f"data-tip='{label}: {_human_bytes(v)} ({pct:.1f}%)'></i>")
+    out.append("</div><div class='tierkeys'>")
+    for key, label in _TIERS:
+        out.append(f"<span class='li'><i class='sw {key}'></i> {label} "
+                   f"<b>{_human_bytes(st['tiers'][key])}</b></span>")
+    out.append("</div>")
+    out.append("<h3>New bytes per day</h3>")
+    out.append(_growth(st))
+    out.append(f"<p class='sub'>{_human_bytes(st['added_total'])} of new content over "
+               f"{len(st['added'])} days &middot; ~{_human_bytes(st['per_year'])}/year "
+               f"at that rate.</p>")
+
+    out.append(f"<h3>Catalog vs disk ({len(st['warn'])})</h3>")
+    if st["warn"]:
+        out.append("<ul class='warn'>")
+        out.extend(f"<li>{html.escape(w)}</li>" for w in st["warn"])
+        out.append("</ul>")
+    else:
+        out.append("<p class='sub'>Every hot snapshot is on disk at its recorded "
+                   "size, and nothing unaccounted-for is.</p>")
+    return "".join(out)
+
+
+def _growth(st):
+    peak = max(st["added"].values()) or 1
+    bars = []
+    for d, v in st["added"].items():
+        tip = f"{d}: {_human_bytes(v)} new" if v else f"{d}: nothing new"
+        bars.append(f"<i style='height:{max(v / peak * 100, 1.5):.1f}%' "
+                    f"class='{'z' if not v else ''}' data-tip='{tip}'></i>")
+    return (f"<div class='growth'><div class='gbars'>{''.join(bars)}</div>"
+            f"<div class='gaxis'><span>{list(st['added'])[0]}</span>"
+            f"<span>peak {_human_bytes(peak)}</span>"
+            f"<span>{list(st['added'])[-1]}</span></div></div>")
+
+
 def _failures(data):
     out = []
     if data["current"]:
@@ -297,6 +435,24 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
 .bar .failed { background: var(--bad); } .bar .missing { background: var(--grid); }
 .ct { font-size: 10px; color: var(--ink2); font-variant-numeric: tabular-nums; }
 .ct .bad { color: var(--bad); font-weight: 600; }
+.tiers { display: flex; height: 22px; gap: 2px; border-radius: 6px; overflow: hidden;
+  background: var(--surface); border: 1px solid var(--border); }
+.tiers i { display: block; }
+.tierkeys { display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0 0;
+  font-size: 12.5px; color: var(--ink2); }
+.tierkeys b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.hot { background: var(--good); } .cold { background: #4b8fd6; }
+.catalog { background: var(--muted); } .other { background: var(--grid); }
+.growth { background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px; }
+.gbars { display: flex; align-items: flex-end; gap: 2px; height: 90px; }
+.gbars i { flex: 1; background: var(--good); border-radius: 2px 2px 0 0; min-width: 3px; }
+.gbars i.z { background: var(--grid); }
+.gaxis { display: flex; justify-content: space-between; margin-top: 5px;
+  font-size: 10.5px; color: var(--muted); }
+.warn { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--ink2); }
+.warn li { margin-bottom: 2px; }
 .fails { border-collapse: collapse; width: 100%; background: var(--surface);
   border: 1px solid var(--border); border-radius: 8px; font-size: 12.5px; }
 .fails th { text-align: left; color: var(--muted); font-weight: 500; }
