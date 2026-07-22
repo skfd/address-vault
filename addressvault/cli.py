@@ -9,7 +9,7 @@
     addressvault data <slug> [<date>|latest] [-o PATH|-]   # stream bytes (thaw-or-error if cold)
     addressvault status <slug> [--json]              # progress of an in-flight/last pull
     addressvault thaw <slug> <date> [--ttl-hours N]  # copy a cold day back to hot
-    addressvault sweep [--keep-days N]               # cool aged hot copies into restic
+    addressvault sweep [--keep-days N]               # cool aged hot copies into restic; drop expired thaws
     addressvault stats [--json]
     addressvault report [--out PATH] [--days N]      # write the HTML status report
 
@@ -124,6 +124,10 @@ def cmd_thaw(vault, args):
 def cmd_sweep(vault, args):
     swept = vault.sweep(keep_days=args.keep_days)
     print(f"  swept {len(swept)} snapshot(s) to cold")
+    # sweep is the only maintenance command this host runs (nothing calls
+    # pull-due/serve), so expired thaw copies would otherwise never be dropped
+    recooled = vault.recool_expired()
+    print(f"  recooled {len(recooled)} expired thaw(s)")
 
 
 def cmd_stats(vault, args):
