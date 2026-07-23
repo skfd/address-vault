@@ -90,16 +90,22 @@ stores no second copy.
 ```
 addressvault seed <datasets_dir>          # import sources from ontario-address-changes/datasets/*.toml
 addressvault sources [--json]
-addressvault pull <slug> [--force]
+addressvault pull <slug> [--force] [--wait]            # --wait: coalesce onto an in-flight pull
 addressvault pull-due                     # pull everything due today, then sweep
 addressvault serve [--interval N]         # run the self-scheduler (one writer)
 addressvault snapshots <slug> [--from D --to D --tier hot|cold] [--json]
 addressvault data <slug> [<date>|latest] [-o PATH|-]   # stream bytes; errors with a thaw hint if cold
 addressvault status <slug> [--json]       # progress of an in-flight (or the last) pull
 addressvault thaw <slug> <date> [--ttl-hours N]
-addressvault sweep [--keep-days N]
+addressvault sweep [--keep-days N]        # cool aged hot copies; drop expired thaws
 addressvault stats [--json]
+addressvault report [--out PATH] [--days N]            # self-contained HTML status page
 ```
+
+`report` renders one static HTML file from the catalog — a city × day matrix
+(new / unchanged / failed / no attempt), a month calendar, storage and growth
+per tier including catalog-vs-disk drift, and the failure log. It defaults to
+`<vault>/report.html`; open it in a browser, no server involved.
 
 ## Scheduling
 
@@ -121,6 +127,8 @@ addressvault pull-due        # run hourly/daily from cron or Windows Task Schedu
   chunk-dedup, it is **not** an encryption-at-rest boundary.
 
 ## Install / test
+
+Python 3.11+.
 
 ```
 pip install -e .            # or .[shapefile] for pyshp/pyproj-backed sources
