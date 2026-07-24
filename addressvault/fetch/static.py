@@ -10,6 +10,7 @@ parses + reprojects in memory (pyshp/pyproj imported lazily).
 import glob
 import json
 import os
+import time
 import zipfile
 from datetime import date as _date
 
@@ -17,6 +18,10 @@ import ijson
 import requests
 
 TIMEOUT = 300
+# A connection dropped mid-body used to cost the whole day's fetch (observed
+# 2026-07-17 and 2026-07-23, both on the ~590 MB dump).
+RETRIES = 3
+RETRY_WAIT = 30
 
 
 def _int(val):
@@ -27,14 +32,42 @@ def _int(val):
 
 
 def _download(url, dest):
-    """Stream ``url`` to ``dest``; return its response headers of interest."""
-    with requests.get(url, stream=True, timeout=TIMEOUT) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 18):
-                f.write(chunk)
-        return {"last_modified": r.headers.get("Last-Modified"),
-                "content_length": _int(r.headers.get("Content-Length"))}
+    """Stream ``url`` to ``dest``; return its response headers of interest.
+
+    Retries a dropped connection, resuming with a Range request where the server
+    allows it and starting over where it doesn't. A content-encoded body can't
+    be resumed: Range counts encoded bytes, and what is on disk is decoded.
+    """
+    got = 0
+    resumable = False
+    headers = {}
+    for attempt in range(RETRIES + 1):
+        want = {"Range": f"bytes={got}-"} if got else {}
+        try:
+            with requests.get(url, stream=True, timeout=TIMEOUT, headers=want) as r:
+                r.raise_for_status()
+                if r.status_code != 206:  # full body: (re)start from byte 0
+                    got = 0
+                    resumable = not r.headers.get("Content-Encoding")
+                    headers = {"last_modified": r.headers.get("Last-Modified"),
+                               "content_length": _int(r.headers.get("Content-Length"))}
+                with open(dest, "ab" if got else "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 18):
+                        f.write(chunk)
+                        got += len(chunk)
+            return headers
+        except (requests.ConnectionError, requests.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            total = headers.get("content_length")
+            if resumable and total and got >= total:
+                return headers  # dropped on the last chunk; the file is whole
+            if attempt == RETRIES:
+                raise
+            if not resumable:
+                got = 0
+            print(f"  download dropped at {got:,} bytes ({e});"
+                  f" retrying in {RETRY_WAIT}s")
+            time.sleep(RETRY_WAIT)
 
 
 def _head(url):

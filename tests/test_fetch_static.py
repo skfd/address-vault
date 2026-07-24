@@ -1,0 +1,96 @@
+"""The static download path: a connection dropped mid-body must not cost the
+whole (~590 MB) fetch."""
+
+import contextlib
+import http.server
+import socketserver
+import threading
+
+import pytest
+import requests
+
+from addressvault.fetch import static
+
+# 1 MB: several 256 KB read chunks, so a drop at the halfway mark leaves real
+# progress on disk (and a wrong resume offset shows up as a corrupt file).
+BODY = b"0123456789abcdef" * 65536
+
+
+@contextlib.contextmanager
+def serve(body, *, drops, honor_range=True):
+    """Serve ``body``, dropping the connection mid-body the first ``drops``
+    requests. Yields (url, state); state["ranges"] records each Range header."""
+    state = {"drops": drops, "ranges": []}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):  # keep test output clean
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            state["ranges"].append(rng)
+            start = 0
+            if rng and honor_range:
+                start = int(rng.split("=")[1].split("-")[0])
+                self.send_response(206)
+                self.send_header(
+                    "Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
+            else:
+                self.send_response(200)
+            chunk = body[start:]
+            self.send_header("Content-Length", str(len(chunk)))
+            self.send_header("Last-Modified", "Wed, 01 Jul 2026 00:00:00 GMT")
+            self.end_headers()
+            if state["drops"] > 0:
+                state["drops"] -= 1
+                self.wfile.write(chunk[:len(chunk) // 2])
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.close()
+                return
+            self.wfile.write(chunk)
+
+    httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}/dump.geojson", state
+    finally:
+        httpd.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def no_wait(monkeypatch):
+    monkeypatch.setattr(static, "RETRY_WAIT", 0)
+
+
+def test_resumes_after_a_dropped_connection(tmp_path):
+    dest = tmp_path / "download.bin"
+    with serve(BODY, drops=1) as (url, state):
+        headers = static._download(url, str(dest))
+
+    assert dest.read_bytes() == BODY
+    assert headers["content_length"] == len(BODY)  # full size, not the 206 tail
+    assert headers["last_modified"] == "Wed, 01 Jul 2026 00:00:00 GMT"
+    assert state["ranges"] == [None, f"bytes={len(BODY) // 2}-"]  # resumed
+
+
+def test_restarts_when_the_server_ignores_range(tmp_path):
+    dest = tmp_path / "download.bin"
+    with serve(BODY, drops=1, honor_range=False) as (url, state):
+        headers = static._download(url, str(dest))
+
+    assert dest.read_bytes() == BODY  # restarted, not appended onto the partial
+    assert headers["content_length"] == len(BODY)
+    assert len(state["ranges"]) == 2
+
+
+def test_gives_up_after_the_retry_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(static, "RETRIES", 2)
+    dest = tmp_path / "download.bin"
+    with serve(BODY, drops=99) as (url, state):
+        with pytest.raises(requests.RequestException):
+            static._download(url, str(dest))
+
+    assert len(state["ranges"]) == 3  # the initial attempt plus RETRIES
