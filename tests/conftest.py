@@ -12,6 +12,14 @@ import pytest
 from addressvault.vault import Vault
 
 
+@pytest.fixture(autouse=True)
+def _unmetered(monkeypatch):
+    """Pulls wait for an unmetered link before fetching; make that wait a no-op
+    everywhere so no test spawns PowerShell or depends on real network state.
+    Detection and the wait have their own tests (test_net.py)."""
+    monkeypatch.setattr("addressvault.net.wait_for_unmetered", lambda **k: None)
+
+
 @pytest.fixture
 def vault(tmp_path):
     return Vault(dir=str(tmp_path / "vault"))

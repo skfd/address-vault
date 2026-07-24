@@ -137,6 +137,23 @@ def test_failed_pull_marks_lease_failed(vault):
     assert job is not None and job["detail"]
 
 
+def test_metered_link_defers_pull_leaving_source_due(vault, http_dir, monkeypatch):
+    from addressvault.net import Metered
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    # Give-up: still metered at the cutoff -> the pull raises, never fetches, and
+    # no snapshot is recorded, so the source stays due for the next run. No lease
+    # is left behind (the wait happens before the lease is acquired).
+    monkeypatch.setattr("addressvault.net.metered", lambda: True)
+    monkeypatch.setattr("addressvault.net.wait_for_unmetered",
+                        lambda **k: (_ for _ in ()).throw(Metered("cutoff")))
+    with pytest.raises(Metered):
+        vault.pull("t", today="2026-01-01")
+    assert vault.cat.get_snapshot("t", "2026-01-01") is None
+    assert vault.pull_status("t") is None  # no lease taken
+
+
 def test_wait_coalesces_onto_holder_result(vault, http_dir):
     base, d = http_dir
     write_geojson(d, "addr.geojson", 3)  # a real fetch would record 3 features

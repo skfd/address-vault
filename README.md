@@ -117,6 +117,13 @@ to run alongside consumers that pull directly. Or drive it from the OS instead:
 addressvault pull-due        # run hourly/daily from cron or Windows Task Scheduler
 ```
 
+On Windows, a `pull` that would download waits out a **metered** connection
+(cellular/tethering, or a Wi-Fi flagged "Metered connection"): it re-checks every
+15 min until the link is unmetered, then fetches — or gives up at a nightly cutoff
+(22:30, before the quiet window) if it never clears. A skipped pull records no
+snapshot, so the source stays due and the next run retries. Detection fails open:
+if the check errors, the pull proceeds.
+
 ## Config
 
 - `ADDRESSVAULT_DIR` — the vault folder (catalog, hot files, restic repo). Required

@@ -45,9 +45,13 @@ def cmd_sources(vault, args):
 
 
 def cmd_pull(vault, args):
+    from addressvault.net import Metered
     if args.wait:
         try:
             snap = vault.pull(args.slug, force=args.force, wait=True)
+        except Metered as e:
+            print(f"  skipped {args.slug}: {e} (still due; will retry next run)")
+            return
         except TimeoutError as e:
             print(f"  {e}", file=sys.stderr)
             sys.exit(1)
@@ -55,6 +59,9 @@ def cmd_pull(vault, args):
         return
     try:
         snap = vault.pull(args.slug, force=args.force)
+    except Metered as e:
+        print(f"  skipped {args.slug}: {e} (still due; will retry next run)")
+        return
     except PullInProgress as e:
         st = e.status
         print(f"  {st.slug} already {st.kind}ing: {st.state} "

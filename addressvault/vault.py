@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from addressvault import archive, config
+from addressvault import archive, config, net
 from addressvault.catalog import Catalog
 from addressvault.fetch import fetch
 from addressvault.sources import Source
@@ -231,6 +231,9 @@ class Vault:
             row = self.cat.get_snapshot(slug, day)
             if row:
                 return Snapshot.from_row(row)
+        # A pull downloads; hold no lease while waiting out a metered link, so a
+        # multi-hour wait never looks like a stale holder to a coalescing peer.
+        net.wait_for_unmetered()
         if not self.cat.acquire_lease(slug, "pull", day, _holder(), self.lease_ttl, "fetching"):
             raise PullInProgress(self.pull_status(slug))
         try:
