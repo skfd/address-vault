@@ -126,11 +126,16 @@ def _src_from_row(row):
 
 
 class Vault:
-    def __init__(self, dir=None):
+    def __init__(self, dir=None, *, link_wait=True):
+        """``link_wait=False`` makes a pull raise ``net.LinkUnavailable`` at once
+        when the host is offline or on a metered link, instead of waiting the
+        link out (see ``net.wait_for_link``). Batch callers want the wait; an
+        interactive one usually wants the error."""
         self.root = config.resolve_dir(dir)
         os.makedirs(self.root, exist_ok=True)
         self.cat = Catalog(config.db_path(self.root))
         self.lease_ttl = LEASE_TTL_SECONDS
+        self.link_wait = link_wait
 
     # --- registry ---
     def seed(self, datasets_dir):
@@ -231,14 +236,22 @@ class Vault:
             row = self.cat.get_snapshot(slug, day)
             if row:
                 return Snapshot.from_row(row)
-        # A pull downloads; hold no lease while waiting out a metered link, so a
-        # multi-hour wait never looks like a stale holder to a coalescing peer.
-        net.wait_for_unmetered()
+        # A pull downloads, so gate it on the link being up and unmetered. Hold
+        # no lease while waiting one out: a multi-hour wait must never look like
+        # a stale holder to a coalescing peer.
+        net.wait_for_link(wait=self.link_wait)
         if not self.cat.acquire_lease(slug, "pull", day, _holder(), self.lease_ttl, "fetching"):
             raise PullInProgress(self.pull_status(slug))
         try:
             return self._pull_locked(slug, src, day, force)
         except PullInProgress:
+            raise
+        except net.LinkUnavailable as e:
+            # The link died mid-fetch. Release the lease, but record no failed
+            # job: the day is "no attempt", not a failure of this source, and a
+            # red cell in the report would be a lie. No snapshot is written, so
+            # the slug stays due and the next run's gate does the waiting.
+            self.cat.set_lease_state(slug, "failed", detail=str(e))
             raise
         except Exception as e:
             self.cat.record_job("pull", slug, day, "failed", detail=str(e))

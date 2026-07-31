@@ -17,6 +17,8 @@ from datetime import date as _date
 import ijson
 import requests
 
+from addressvault import net
+
 TIMEOUT = 300
 # A connection dropped mid-body used to cost the whole day's fetch (observed
 # 2026-07-17 and 2026-07-23, both on the ~590 MB dump).
@@ -62,6 +64,11 @@ def _download(url, dest):
             if resumable and total and got >= total:
                 return headers  # dropped on the last chunk; the file is whole
             if attempt == RETRIES:
+                # Out of retries. If the link itself is down, this was never a
+                # source failure -- say so, so the caller skips the day instead
+                # of logging a failure. No waiting here: we hold the slug's
+                # lease, so deferring is the pre-lease gate's job, not ours.
+                net.wait_for_link(wait=False)
                 raise
             if not resumable:
                 got = 0

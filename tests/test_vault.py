@@ -119,9 +119,11 @@ def test_stale_lease_is_reclaimed(vault, http_dir):
     assert vault.pull_status("t").state == "done"
 
 
-def test_failed_pull_marks_lease_failed(vault):
+def test_failed_pull_marks_lease_failed(vault, monkeypatch):
     # Unreachable source -> fetch raises -> lease ends "failed" with detail, and
     # the slug is not left wedged (a later valid pull can reclaim it).
+    # The real fetch spends its whole retry budget getting here; don't sleep it.
+    monkeypatch.setattr("addressvault.fetch.static.RETRY_WAIT", 0)
     vault.add_source(Source(slug="t", provider="T",
                             data_url="http://127.0.0.1:1/missing.geojson",
                             access="static", format="geojson"))
@@ -137,21 +139,61 @@ def test_failed_pull_marks_lease_failed(vault):
     assert job is not None and job["detail"]
 
 
-def test_metered_link_defers_pull_leaving_source_due(vault, http_dir, monkeypatch):
-    from addressvault.net import Metered
+@pytest.mark.parametrize("exc", [
+    pytest.param("Metered", id="metered"), pytest.param("Offline", id="offline"),
+])
+def test_unusable_link_defers_pull_leaving_source_due(vault, http_dir, monkeypatch, exc):
+    from addressvault import net
+    raised = getattr(net, exc)
     base, d = http_dir
     write_geojson(d, "addr.geojson", 3)
     _add(vault, base)
-    # Give-up: still metered at the cutoff -> the pull raises, never fetches, and
+    # Give-up: still unusable at the cutoff -> the pull raises, never fetches, and
     # no snapshot is recorded, so the source stays due for the next run. No lease
-    # is left behind (the wait happens before the lease is acquired).
-    monkeypatch.setattr("addressvault.net.metered", lambda: True)
-    monkeypatch.setattr("addressvault.net.wait_for_unmetered",
-                        lambda **k: (_ for _ in ()).throw(Metered("cutoff")))
-    with pytest.raises(Metered):
+    # is left behind (the gate runs before the lease is acquired).
+    monkeypatch.setattr("addressvault.net.wait_for_link",
+                        lambda **k: (_ for _ in ()).throw(raised("cutoff")))
+    with pytest.raises(raised):
         vault.pull("t", today="2026-01-01")
     assert vault.cat.get_snapshot("t", "2026-01-01") is None
     assert vault.pull_status("t") is None  # no lease taken
+
+
+def test_link_lost_mid_fetch_releases_the_lease_but_logs_no_failure(vault, monkeypatch):
+    from addressvault import net
+    # The gate passed, the lease was taken, then the link went down under the
+    # download. That is "no attempt", not a failed source: the lease must end
+    # terminal so a peer can reclaim the slug, but no durable failed job may be
+    # written, or the report paints a red cell for a day nobody could fetch.
+    vault.add_source(Source(slug="t", provider="T",
+                            data_url="http://127.0.0.1:1/missing.geojson",
+                            access="static", format="geojson"))
+    monkeypatch.setattr("addressvault.fetch.static.fetch",
+                        lambda *a, **k: (_ for _ in ()).throw(net.Offline("link is offline")))
+    with pytest.raises(net.Offline):
+        vault.pull("t", today="2026-01-01")
+    st = vault.pull_status("t")
+    assert st.state == "failed" and not st.active  # reclaimable, not wedged
+    assert vault.cat.conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE kind='pull' AND slug='t'").fetchone()[0] == 0
+    assert vault.cat.get_snapshot("t", "2026-01-01") is None  # still due
+
+
+def test_pull_due_stops_at_an_unusable_link(vault, monkeypatch):
+    from addressvault import net, scheduler
+    for slug in ("a", "b", "c"):
+        vault.add_source(Source(slug=slug, provider="T",
+                                data_url="http://127.0.0.1:1/x.geojson",
+                                access="static", format="geojson"))
+    tried = []
+
+    def _pull(slug, **k):
+        tried.append(slug)
+        raise net.Offline("link is offline")
+
+    monkeypatch.setattr(vault, "pull", _pull)
+    scheduler.pull_due(vault, today="2026-01-01")
+    assert tried == ["a"]  # host-wide: b and c cannot fare better, stay due
 
 
 def test_wait_coalesces_onto_holder_result(vault, http_dir):

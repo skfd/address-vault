@@ -117,12 +117,30 @@ to run alongside consumers that pull directly. Or drive it from the OS instead:
 addressvault pull-due        # run hourly/daily from cron or Windows Task Scheduler
 ```
 
-On Windows, a `pull` that would download waits out a **metered** connection
-(cellular/tethering, or a Wi-Fi flagged "Metered connection"): it re-checks every
-15 min until the link is unmetered, then fetches — or gives up at a nightly cutoff
-(22:30, before the quiet window) if it never clears. A skipped pull records no
-snapshot, so the source stays due and the next run retries. Detection fails open:
-if the check errors, the pull proceeds.
+### The link gate
+
+A `pull` that would download first checks the link, since two host-wide
+conditions make fetching pointless or expensive:
+
+- **offline** — nothing answers on 443 at `1.1.1.1`/`8.8.8.8`/`9.9.9.9`;
+- **metered** — Windows reports cellular/tethering, or a Wi-Fi flagged
+  "Metered connection".
+
+Either way the pull re-checks every 15 min until the link is usable, then
+fetches — or gives up at a nightly cutoff (22:30, before the quiet window) if it
+never clears. A skipped pull records no snapshot and no failed job, so the source
+stays due, the next run retries it, and the report shows "no attempt" rather than
+a failure. `pull-due` stops the whole run at the first unusable link instead of
+walking the remaining cities into the same wall.
+
+The two probes fail in opposite directions on purpose: metered fails **open** (a
+broken API never silently blocks updates), offline fails **closed** (nothing
+answering *is* the observation). DNS is deliberately not probed — a resolver that
+fails while the link is up is a fetch-level error, retried by the fetchers.
+
+Callers who want the error rather than the wait pass `Vault(link_wait=False)`.
+The CLI's `pull` exits **75** (`EX_TEMPFAIL`) when the link is unusable, so a
+wrapper script can tell "no network" apart from a real failure.
 
 ## Config
 

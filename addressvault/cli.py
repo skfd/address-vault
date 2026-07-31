@@ -14,6 +14,9 @@
     addressvault report [--out PATH] [--days N]      # write the HTML status report
 
 Set ADDRESSVAULT_DIR (or pass --dir) to the vault folder.
+
+``pull`` exits 75 when the host is offline or on a metered link: nothing was
+fetched, nothing failed, and the source stays due for the next run.
 """
 
 import argparse
@@ -22,6 +25,13 @@ import shutil
 import sys
 
 from addressvault.vault import Archived, PullInProgress, Vault
+
+# Offline/metered is not a pipeline failure -- same as if the laptop had been
+# off, the pull just didn't happen -- but it isn't success either, since no
+# fresh data landed. 75 is the conventional EX_TEMPFAIL ("try again later"), so
+# a wrapper can tell "no network" apart from a real error and skip the rest of
+# its chain quietly. Mirrors daily-update.ps1's offline/metered handling.
+EXIT_LINK_UNAVAILABLE = 75
 
 
 def _print_snap(s):
@@ -45,24 +55,16 @@ def cmd_sources(vault, args):
 
 
 def cmd_pull(vault, args):
-    from addressvault.net import Metered
-    if args.wait:
-        try:
-            snap = vault.pull(args.slug, force=args.force, wait=True)
-        except Metered as e:
-            print(f"  skipped {args.slug}: {e} (still due; will retry next run)")
-            return
-        except TimeoutError as e:
-            print(f"  {e}", file=sys.stderr)
-            sys.exit(1)
-        _print_snap(snap)
-        return
+    from addressvault.net import LinkUnavailable
     try:
-        snap = vault.pull(args.slug, force=args.force)
-    except Metered as e:
+        snap = vault.pull(args.slug, force=args.force, wait=args.wait)
+    except LinkUnavailable as e:
         print(f"  skipped {args.slug}: {e} (still due; will retry next run)")
-        return
-    except PullInProgress as e:
+        sys.exit(EXIT_LINK_UNAVAILABLE)
+    except TimeoutError as e:  # --wait deadline only
+        print(f"  {e}", file=sys.stderr)
+        sys.exit(1)
+    except PullInProgress as e:  # without --wait only; --wait coalesces instead
         st = e.status
         print(f"  {st.slug} already {st.kind}ing: {st.state} "
               f"(holder {st.holder}, since {st.started_at})")

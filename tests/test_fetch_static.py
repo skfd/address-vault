@@ -94,3 +94,20 @@ def test_gives_up_after_the_retry_budget(tmp_path, monkeypatch):
             static._download(url, str(dest))
 
     assert len(state["ranges"]) == 3  # the initial attempt plus RETRIES
+
+
+def test_a_down_link_surfaces_as_link_unavailable_not_a_source_failure(
+        tmp_path, monkeypatch):
+    # The budget buys ~90s, nowhere near long enough to outlast an outage. On
+    # exhaustion, ask why: a dead link is the gate's business, and the caller
+    # must see LinkUnavailable (skip the day) rather than a download error
+    # (log a failure against a source that was never reachable to begin with).
+    from addressvault import net
+
+    monkeypatch.setattr(static, "RETRIES", 1)
+    monkeypatch.setattr("addressvault.net.wait_for_link",
+                        lambda **k: (_ for _ in ()).throw(net.Offline("link is offline")))
+    dest = tmp_path / "download.bin"
+    with serve(BODY, drops=99) as (url, _state):
+        with pytest.raises(net.Offline):
+            static._download(url, str(dest))

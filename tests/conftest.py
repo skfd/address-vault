@@ -9,15 +9,19 @@ import threading
 
 import pytest
 
+from addressvault import net
 from addressvault.vault import Vault
 
 
 @pytest.fixture(autouse=True)
-def _unmetered(monkeypatch):
-    """Pulls wait for an unmetered link before fetching; make that wait a no-op
-    everywhere so no test spawns PowerShell or depends on real network state.
-    Detection and the wait have their own tests (test_net.py)."""
-    monkeypatch.setattr("addressvault.net.wait_for_unmetered", lambda **k: None)
+def _usable_link(monkeypatch):
+    """Pulls gate on a usable link before fetching; make that gate a no-op
+    everywhere so no test spawns PowerShell, opens a socket, or depends on real
+    network state. Detection and the wait have their own tests (test_net.py).
+    The probe cache is per-process, so clear it too or one test's stubbed
+    verdict leaks into the next."""
+    net.reset_cache()
+    monkeypatch.setattr("addressvault.net.wait_for_link", lambda **k: None)
 
 
 @pytest.fixture

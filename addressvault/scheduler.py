@@ -9,6 +9,8 @@ from cron instead (``addressvault pull-due``).
 import time
 from datetime import date
 
+from addressvault import net
+
 
 def is_due(vault, src, today=None):
     """Daily cadence: due when there is no snapshot recorded for today."""
@@ -26,6 +28,11 @@ def pull_due(vault, today=None, keep_days=2):
             continue
         try:
             pulled.append(vault.pull(src.slug, today=today))
+        except net.LinkUnavailable as e:
+            # Host-wide, so the remaining sources cannot fare any better; they
+            # stay due for the next run. Sweeping still can (restic is local).
+            print(f"  [pull] {e}; stopping after {len(pulled)} pulled")
+            break
         except Exception as e:  # one bad source must not stop the rest
             print(f"  [pull] {src.slug} failed: {e}")
     vault.sweep(keep_days=keep_days, today=today)

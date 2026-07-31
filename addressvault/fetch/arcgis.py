@@ -12,6 +12,8 @@ from datetime import date as _date
 
 import requests
 
+from addressvault import net
+
 TIMEOUT = 120
 DEFAULT_PAGE = 2000
 # maps.ottawa.ca (F5 GSLB) started dropping new TCP connections after ~15-35
@@ -60,7 +62,32 @@ def fetch(source, dest_dir, *, force=False, today=None):
     filepath = os.path.join(dest_dir, filename)
 
     session = requests.Session()
-    meta = _layer_meta(session, source.data_url)
+    retries = RETRIES
+
+    def _pause(exc, what):
+        """Shared by the metadata call and by each page: wait out the block,
+        then hand back a fresh Session (a blocked connection won't recover).
+        Re-raises once the shared budget is spent, or at once if the link itself
+        is down -- we hold the slug's lease here, so deferring belongs to the
+        pre-lease gate, not to us."""
+        nonlocal retries, session
+        net.wait_for_link(wait=False)
+        if not retries:
+            raise exc
+        retries -= 1
+        print(f"\n  {what}; retrying in {RETRY_WAIT}s")
+        time.sleep(RETRY_WAIT)
+        session = requests.Session()
+
+    # The metadata call draws on the same budget as a page: it is just as
+    # droppable, and a blip on this first request used to cost the whole city.
+    while True:
+        try:
+            meta = _layer_meta(session, source.data_url)
+            break
+        except (requests.ConnectionError, requests.Timeout) as e:
+            _pause(e, f"{source.slug} metadata unreachable")
+
     page = min(meta.get("maxRecordCount") or DEFAULT_PAGE, DEFAULT_PAGE)
     can_geojson = "geoJSON" in (meta.get("supportedQueryFormats") or "")
     fmt = "geojson" if can_geojson else "json"
@@ -69,7 +96,6 @@ def fetch(source, dest_dir, *, force=False, today=None):
 
     features = []
     last_oid = -1
-    retries = RETRIES
     while True:
         params = {
             "where": f"{oid_field} > {last_oid}", "outFields": "*",
@@ -78,14 +104,9 @@ def fetch(source, dest_dir, *, force=False, today=None):
         }
         try:
             data = _query(session, source.data_url, params)
-        except (requests.ConnectionError, requests.Timeout):
-            if not retries:
-                raise
-            retries -= 1
-            print(f"\n  stalled at {len(features):,} features; "
-                  f"resuming past {oid_field} {last_oid} in {RETRY_WAIT}s")
-            time.sleep(RETRY_WAIT)
-            session = requests.Session()  # a blocked connection won't recover
+        except (requests.ConnectionError, requests.Timeout) as e:
+            _pause(e, f"stalled at {len(features):,} features; "
+                      f"resuming past {oid_field} {last_oid}")
             continue
         batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
         if not batch:
