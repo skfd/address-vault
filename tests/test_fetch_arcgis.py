@@ -91,6 +91,34 @@ def test_metadata_and_pages_share_one_budget(tmp_path, monkeypatch):
         arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
 
 
+def test_an_error_body_under_http_200_is_not_a_layer(tmp_path, monkeypatch):
+    # ArcGIS reports server-side failures as {"error": ...} with a 200, which
+    # used to read as a layer with no maxRecordCount and no features.
+    class _Resp:
+        @staticmethod
+        def raise_for_status():
+            pass
+
+        @staticmethod
+        def json():
+            return {"error": {"code": 500, "message": "Unable to complete operation"}}
+
+    monkeypatch.setattr(arcgis, "TIMEOUT", 0)
+    monkeypatch.setattr(requests.Session, "get", lambda self, u, **k: _Resp())
+    with pytest.raises(ValueError, match="Unable to complete operation"):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert list(tmp_path.iterdir()) == []  # nothing written over a real city
+
+
+def test_an_empty_first_page_fails_instead_of_writing_an_empty_snapshot(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: _page())
+    with pytest.raises(ValueError, match="first page returned no features"):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_a_down_link_surfaces_as_link_unavailable_without_burning_retries(
         tmp_path, monkeypatch):
     # We hold the slug's lease inside fetch, so a dead link must abort at once

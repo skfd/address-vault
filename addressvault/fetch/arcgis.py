@@ -24,16 +24,28 @@ RETRIES = 3
 RETRY_WAIT = 900
 
 
-def _layer_meta(session, url):
-    r = session.get(url, params={"f": "json"}, timeout=TIMEOUT)
+def _json(r):
+    """Parse a response, rejecting the error bodies ArcGIS serves under HTTP 200.
+
+    raise_for_status() sees those as healthy, so left unchecked the caller reads
+    a body with no maxRecordCount and no features as a tiny layer that is already
+    exhausted -- and writes an empty snapshot over a real city (york,
+    2026-07-31: metadata and first page both degraded, 431k addresses -> 0)."""
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if isinstance(body, dict) and "error" in body:
+        err = body["error"] if isinstance(body["error"], dict) else {}
+        raise ValueError(f"arcgis error {err.get('code', '?')}: "
+                         f"{err.get('message') or body['error']}")
+    return body
+
+
+def _layer_meta(session, url):
+    return _json(session.get(url, params={"f": "json"}, timeout=TIMEOUT))
 
 
 def _query(session, url, params):
-    r = session.get(url + "/query", params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    return _json(session.get(url + "/query", params=params, timeout=TIMEOUT))
 
 
 def _esri_to_geojson(esri):
@@ -110,6 +122,12 @@ def fetch(source, dest_dir, *, force=False, today=None):
             continue
         batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
         if not batch:
+            # An empty page only terminates once we hold rows. No address layer
+            # is legitimately empty, so an empty *first* page is the source
+            # failing in some way the error check above did not catch -- fail
+            # loudly instead of recording today as a city with no addresses.
+            if not features:
+                raise ValueError("first page returned no features")
             break
         features.extend(batch)
         last_oid = _max_oid(batch, oid_field)
