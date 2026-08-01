@@ -53,7 +53,9 @@ def _collect(cat, root, days, today):
         fails[(r["slug"], r["date"])] = r["detail"] or ""
 
     # A currently-failed lease is the freshest error we have (and, before the
-    # job log started recording failures, the only one).
+    # job log started recording failures, the only one). Only ``failed``: a
+    # ``deferred`` lease means the link died under the pull, which is a "no
+    # attempt" day, not a failure to hold against the source.
     current = []  # (slug, date, detail, updated_at)
     for r in cat.conn.execute(
         "SELECT slug, date, detail, updated_at FROM leases WHERE state='failed' "

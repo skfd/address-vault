@@ -45,8 +45,11 @@ CREATE TABLE IF NOT EXISTS leases(
 );
 """
 
-# A lease is "done"/"failed" once its writer finishes; any other state is live.
-_TERMINAL_STATES = ("done", "failed")
+# A lease is finished once its writer stops: it succeeded ("done"), the source
+# failed ("failed"), or the link went down under it ("deferred" -- no attempt to
+# hold against the source). Any other state is live. Shared with
+# ``PullStatus.active``: a state missing here leaves the slug wedged.
+TERMINAL_STATES = ("done", "failed", "deferred")
 
 _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",
@@ -188,7 +191,7 @@ class Catalog:
             row = self.conn.execute(
                 "SELECT state, updated_at FROM leases WHERE slug=?", (slug,)
             ).fetchone()
-            if row is not None and row["state"] not in _TERMINAL_STATES:
+            if row is not None and row["state"] not in TERMINAL_STATES:
                 age = (now - datetime.fromisoformat(row["updated_at"])).total_seconds()
                 if age <= ttl_seconds:
                     self.conn.execute("COMMIT")

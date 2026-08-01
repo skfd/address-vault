@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from addressvault import archive, config, net
-from addressvault.catalog import Catalog
+from addressvault.catalog import TERMINAL_STATES, Catalog
 from addressvault.fetch import fetch
 from addressvault.sources import Source
 
@@ -93,7 +93,7 @@ class PullStatus:
 
     @property
     def active(self):
-        return self.state not in ("done", "failed")
+        return self.state not in TERMINAL_STATES
 
     @classmethod
     def from_row(cls, row):
@@ -251,7 +251,10 @@ class Vault:
             # job: the day is "no attempt", not a failure of this source, and a
             # red cell in the report would be a lie. No snapshot is written, so
             # the slug stays due and the next run's gate does the waiting.
-            self.cat.set_lease_state(slug, "failed", detail=str(e))
+            # "deferred", not "failed": terminal either way, so a peer can
+            # reclaim the slug -- but the report reads failed *leases* as the
+            # freshest error it has, and would repaint that same red cell.
+            self.cat.set_lease_state(slug, "deferred", detail=str(e))
             raise
         except Exception as e:
             self.cat.record_job("pull", slug, day, "failed", detail=str(e))

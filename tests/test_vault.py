@@ -173,7 +173,7 @@ def test_link_lost_mid_fetch_releases_the_lease_but_logs_no_failure(vault, monke
     with pytest.raises(net.Offline):
         vault.pull("t", today="2026-01-01")
     st = vault.pull_status("t")
-    assert st.state == "failed" and not st.active  # reclaimable, not wedged
+    assert st.state == "deferred" and not st.active  # reclaimable, not wedged
     assert vault.cat.conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE kind='pull' AND slug='t'").fetchone()[0] == 0
     assert vault.cat.get_snapshot("t", "2026-01-01") is None  # still due
@@ -192,8 +192,28 @@ def test_pull_due_stops_at_an_unusable_link(vault, monkeypatch):
         raise net.Offline("link is offline")
 
     monkeypatch.setattr(vault, "pull", _pull)
-    scheduler.pull_due(vault, today="2026-01-01")
+    # Raised, not swallowed: 'addressvault pull-due' turns it into exit 75 so a
+    # wrapper can tell "no network" from "everything fetched".
+    with pytest.raises(net.Offline):
+        scheduler.pull_due(vault, today="2026-01-01")
     assert tried == ["a"]  # host-wide: b and c cannot fare better, stay due
+
+
+def test_pull_due_still_sweeps_when_the_link_is_down(vault, monkeypatch):
+    from addressvault import net, scheduler
+    # Sweeping is local (restic), so an outage must not cost the day's cold
+    # tiering -- the raise happens after it, not instead of it.
+    vault.add_source(Source(slug="a", provider="T",
+                            data_url="http://127.0.0.1:1/x.geojson",
+                            access="static", format="geojson"))
+    swept = []
+    monkeypatch.setattr(vault, "pull",
+                        lambda slug, **k: (_ for _ in ()).throw(net.Offline("link is offline")))
+    monkeypatch.setattr(vault, "sweep", lambda **k: swept.append(k))
+    monkeypatch.setattr(vault, "recool_expired", lambda: swept.append("recool"))
+    with pytest.raises(net.Offline):
+        scheduler.pull_due(vault, today="2026-01-01")
+    assert len(swept) == 2
 
 
 def test_wait_coalesces_onto_holder_result(vault, http_dir):

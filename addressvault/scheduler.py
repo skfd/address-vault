@@ -22,7 +22,11 @@ def is_due(vault, src, today=None):
 
 
 def pull_due(vault, today=None, keep_days=2):
+    """Pull every due source, then sweep. Raises ``net.LinkUnavailable`` if the
+    link stopped the run, so a cron wrapper can tell "no network" from "all
+    cities fetched" -- but only after sweeping, which needs no link at all."""
     pulled = []
+    deferred = None
     for src in vault.sources():
         if not is_due(vault, src, today=today):
             continue
@@ -32,11 +36,14 @@ def pull_due(vault, today=None, keep_days=2):
             # Host-wide, so the remaining sources cannot fare any better; they
             # stay due for the next run. Sweeping still can (restic is local).
             print(f"  [pull] {e}; stopping after {len(pulled)} pulled")
+            deferred = e
             break
         except Exception as e:  # one bad source must not stop the rest
             print(f"  [pull] {src.slug} failed: {e}")
     vault.sweep(keep_days=keep_days, today=today)
     vault.recool_expired()
+    if deferred is not None:
+        raise deferred
     return pulled
 
 
@@ -44,6 +51,11 @@ def serve(vault, interval=3600, keep_days=2):
     n = len(vault.sources())
     print(f"address-vault scheduler: {n} sources, every {interval}s")
     while True:
-        pulled = pull_due(vault, keep_days=keep_days)
-        print(f"  pulled {len(pulled)} due source(s); sleeping {interval}s")
+        try:
+            pulled = pull_due(vault, keep_days=keep_days)
+            print(f"  pulled {len(pulled)} due source(s); sleeping {interval}s")
+        except net.LinkUnavailable as e:
+            # A long-lived loop rides out an outage: the sources stay due, so
+            # the next cycle picks them up once the link is back.
+            print(f"  {e}; sleeping {interval}s")
         time.sleep(interval)

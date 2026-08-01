@@ -15,8 +15,8 @@
 
 Set ADDRESSVAULT_DIR (or pass --dir) to the vault folder.
 
-``pull`` exits 75 when the host is offline or on a metered link: nothing was
-fetched, nothing failed, and the source stays due for the next run.
+``pull`` and ``pull-due`` exit 75 when the host is offline or on a metered link:
+nothing was fetched, nothing failed, and the sources stay due for the next run.
 """
 
 import argparse
@@ -90,7 +90,14 @@ def cmd_status(vault, args):
 
 def cmd_pull_due(vault, args):
     from addressvault import scheduler
-    pulled = scheduler.pull_due(vault, keep_days=args.keep_days)
+    from addressvault.net import LinkUnavailable
+    try:
+        pulled = scheduler.pull_due(vault, keep_days=args.keep_days)
+    except LinkUnavailable as e:
+        # The sweep already ran; only the pulls were skipped. Same 75 as
+        # ``pull``, so one wrapper rule covers both entry points.
+        print(f"  skipped remaining sources: {e} (still due; swept anyway)")
+        sys.exit(EXIT_LINK_UNAVAILABLE)
     print(f"  pulled {len(pulled)} due source(s)")
 
 

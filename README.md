@@ -130,17 +130,20 @@ Either way the pull re-checks every 15 min until the link is usable, then
 fetches — or gives up at a nightly cutoff (22:30, before the quiet window) if it
 never clears. A skipped pull records no snapshot and no failed job, so the source
 stays due, the next run retries it, and the report shows "no attempt" rather than
-a failure. `pull-due` stops the whole run at the first unusable link instead of
-walking the remaining cities into the same wall.
+a failure — a link that drops *mid*-fetch ends the lease `deferred` rather than
+`failed` for the same reason. `pull-due` stops the whole run at the first
+unusable link instead of walking the remaining cities into the same wall; it
+still sweeps, since restic is local.
 
 The two probes fail in opposite directions on purpose: metered fails **open** (a
 broken API never silently blocks updates), offline fails **closed** (nothing
 answering *is* the observation). DNS is deliberately not probed — a resolver that
 fails while the link is up is a fetch-level error, retried by the fetchers.
 
-Callers who want the error rather than the wait pass `Vault(link_wait=False)`.
-The CLI's `pull` exits **75** (`EX_TEMPFAIL`) when the link is unusable, so a
-wrapper script can tell "no network" apart from a real failure.
+Callers who want the error rather than the wait pass `Vault(link_wait=False)` and
+catch `LinkUnavailable` (or `Offline`/`Metered`), exported from the package root.
+The CLI's `pull` and `pull-due` exit **75** (`EX_TEMPFAIL`) when the link is
+unusable, so a wrapper script can tell "no network" apart from a real failure.
 
 ## Config
 
