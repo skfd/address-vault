@@ -96,6 +96,24 @@ def test_gives_up_after_the_retry_budget(tmp_path, monkeypatch):
     assert len(state["ranges"]) == 3  # the initial attempt plus RETRIES
 
 
+def test_a_failed_head_on_a_down_link_defers_instead_of_downloading(monkeypatch):
+    # "Check failed, download anyway" is right for a flaky remote and wrong for
+    # a dead link: the download cannot work either, and would spend the whole
+    # retry budget rediscovering that. The gate answers before we fall through.
+    from addressvault import net
+
+    monkeypatch.setattr("addressvault.net.wait_for_link",
+                        lambda **k: (_ for _ in ()).throw(net.Offline("link is offline")))
+    with pytest.raises(net.Offline):
+        static._head("http://127.0.0.1:1/nothing")  # refused: nothing listens
+
+
+def test_a_failed_head_on_a_live_link_still_falls_through_to_the_download():
+    # The autouse fixture leaves the gate open, so a HEAD that failed for any
+    # other reason keeps the old behaviour: no headers, download it blind.
+    assert static._head("http://127.0.0.1:1/nothing") == {}
+
+
 def test_a_down_link_surfaces_as_link_unavailable_not_a_source_failure(
         tmp_path, monkeypatch):
     # The budget buys ~90s, nowhere near long enough to outlast an outage. On

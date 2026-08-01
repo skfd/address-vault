@@ -84,6 +84,12 @@ def _head(url):
         return {"last_modified": r.headers.get("Last-Modified"),
                 "content_length": _int(r.headers.get("Content-Length"))}
     except requests.RequestException as e:
+        # Ask why before falling through to the download. Shrugging it off is
+        # right for a flaky remote, but a dead link makes the download pointless
+        # too, and the caller would spend the whole retry budget rediscovering
+        # that. Same question ``_download`` asks on exhaustion, same wait=False:
+        # we hold the slug's lease, so deferring is the pre-lease gate's job.
+        net.wait_for_link(wait=False)
         print(f"  (HEAD check failed, will download: {e})")
         return {}
 

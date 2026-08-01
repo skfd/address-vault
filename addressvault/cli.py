@@ -17,6 +17,8 @@ Set ADDRESSVAULT_DIR (or pass --dir) to the vault folder.
 
 ``pull`` and ``pull-due`` exit 75 when the host is offline or on a metered link:
 nothing was fetched, nothing failed, and the sources stay due for the next run.
+``pull-due`` and ``serve`` wait the link out first (up to the nightly cutoff);
+``pull`` is interactive, so it reports the 75 straight away.
 """
 
 import argparse
@@ -198,7 +200,11 @@ def main(argv=None):
     sp.add_argument("--days", type=int, default=42)
 
     args = p.parse_args(argv)
-    vault = Vault(dir=args.dir)
+    # The batch entry points wait a bad link out (they are driven by a scheduler
+    # and have all afternoon); ``pull`` is interactive, and a block until the
+    # 22:30 cutoff is not what someone at a prompt wants -- they get the 75 now.
+    batch = args.command in ("pull-due", "serve")
+    vault = Vault(dir=args.dir, link_wait=batch)
     handlers = {
         "seed": cmd_seed, "sources": cmd_sources, "pull": cmd_pull,
         "pull-due": cmd_pull_due, "serve": cmd_serve, "snapshots": cmd_snapshots,

@@ -143,7 +143,13 @@ fails while the link is up is a fetch-level error, retried by the fetchers.
 Callers who want the error rather than the wait pass `Vault(link_wait=False)` and
 catch `LinkUnavailable` (or `Offline`/`Metered`), exported from the package root.
 The CLI's `pull` and `pull-due` exit **75** (`EX_TEMPFAIL`) when the link is
-unusable, so a wrapper script can tell "no network" apart from a real failure.
+unusable, so a wrapper script can tell "no network" apart from a real failure —
+`pull-due` and `serve` wait it out first, while `pull` reports it immediately,
+since blocking a prompt until 22:30 helps nobody.
+
+The sibling tile builders (`toronto-parks-layer`, `toronto-streets-layer`) reuse
+`addressvault.net` for the same gate. They run weekly and fail fast rather than
+waiting, since their scheduled tasks carry a hard `ExecutionTimeLimit`.
 
 ## Config
 
