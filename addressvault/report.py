@@ -22,7 +22,8 @@ from datetime import date, datetime, timedelta, timezone
 from addressvault import archive, config
 
 # Cell states, in legend order.
-NEW, UNCHANGED, FAILED, MISSING = "new", "unchanged", "failed", "missing"
+NEW, UNCHANGED, FAILED, REFUSED, MISSING = \
+    "new", "unchanged", "failed", "refused", "missing"
 
 
 def build(vault, days=42, out=None, today=None):
@@ -45,36 +46,50 @@ def _collect(cat, root, days, today):
     for r in cat.conn.execute("SELECT * FROM snapshots WHERE date>=?", (frm,)):
         snaps[(r["slug"], r["date"])] = r
 
-    fails = {}  # (slug, date) -> detail (latest failed pull job for that day)
+    # A refused pull is tracked apart from a failed one the whole way through:
+    # a failure is the source being unreachable and fixes itself, a refusal is
+    # data we threw away and is waiting on somebody to look at it.
+    fails = {}    # (slug, date) -> detail (latest failed pull job for that day)
+    refused = {}  # (slug, date) -> detail, same for pulls the guards threw out
     for r in cat.conn.execute(
-        "SELECT slug, date, detail FROM jobs WHERE kind='pull' AND state='failed' "
-        "AND date>=? ORDER BY created_at", (frm,)
+        "SELECT slug, date, state, detail FROM jobs WHERE kind='pull' "
+        "AND state IN ('failed','refused') AND date>=? ORDER BY created_at", (frm,)
     ):
-        fails[(r["slug"], r["date"])] = r["detail"] or ""
+        bucket = refused if r["state"] == "refused" else fails
+        bucket[(r["slug"], r["date"])] = r["detail"] or ""
 
     # A currently-failed lease is the freshest error we have (and, before the
     # job log started recording failures, the only one). Only ``failed``: a
     # ``deferred`` lease means the link died under the pull, which is a "no
     # attempt" day, not a failure to hold against the source.
-    current = []  # (slug, date, detail, updated_at)
+    current = []   # (slug, date, detail, updated_at) — last pull errored
+    standing = []  # ...and the subset still refusing, which needs a person
     for r in cat.conn.execute(
-        "SELECT slug, date, detail, updated_at FROM leases WHERE state='failed' "
-        "ORDER BY updated_at DESC"
+        "SELECT slug, date, state, detail, updated_at FROM leases "
+        "WHERE state IN ('failed','refused') ORDER BY updated_at DESC"
     ):
-        current.append((r["slug"], r["date"], r["detail"] or "", r["updated_at"]))
-        if r["date"] and r["date"] >= frm:
-            fails.setdefault((r["slug"], r["date"]), r["detail"] or "")
+        row = (r["slug"], r["date"], r["detail"] or "", r["updated_at"])
+        if r["state"] == "refused":
+            standing.append(row)
+            if r["date"] and r["date"] >= frm:
+                refused.setdefault((r["slug"], r["date"]), r["detail"] or "")
+        else:
+            current.append(row)
+            if r["date"] and r["date"] >= frm:
+                fails.setdefault((r["slug"], r["date"]), r["detail"] or "")
 
     log = cat.conn.execute(
-        "SELECT slug, date, detail, created_at FROM jobs "
-        "WHERE kind='pull' AND state='failed' ORDER BY created_at DESC LIMIT 100"
+        "SELECT slug, date, state, detail, created_at FROM jobs "
+        "WHERE kind='pull' AND state IN ('failed','refused') "
+        "ORDER BY created_at DESC LIMIT 100"
     ).fetchall()
 
     return {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "today": today.isoformat(),
         "dates": dates, "slugs": slugs, "snaps": snaps, "fails": fails,
-        "current": current, "log": log, "stats": cat.stats(),
+        "refused": refused, "current": current, "standing": standing,
+        "log": log, "stats": cat.stats(),
         "storage": _storage(cat, root, dates),
     }
 
@@ -171,6 +186,9 @@ def _cell(data, slug, d):
                                f"{s['unchanged_since']} ({s['features']:,} features)")
         return NEW, (f"{slug} {d}: new data, {s['features']:,} features, "
                      f"{_human_bytes(s['bytes'])} ({tier})")
+    detail = data["refused"].get((slug, d))
+    if detail is not None:
+        return REFUSED, f"{slug} {d}: pull REFUSED, nothing recorded -- {detail[:200]}"
     detail = data["fails"].get((slug, d))
     if detail is not None:
         return FAILED, f"{slug} {d}: pull FAILED -- {detail[:200]}"
@@ -219,13 +237,17 @@ def _kpis(st):
     return f"<div class='kpis'>{cells}</div>"
 
 
+_GLYPH = {FAILED: "&times;", REFUSED: "!"}
+
+
 def _legend():
     items = [
         (NEW, "new data"), (UNCHANGED, "pulled, unchanged"),
-        (FAILED, "failed"), (MISSING, "no attempt"),
+        (FAILED, "failed"), (REFUSED, "refused — needs a look"),
+        (MISSING, "no attempt"),
     ]
     cells = "".join(
-        f"<span class='li'><span class='cell {s}'>{'&times;' if s == FAILED else ''}"
+        f"<span class='li'><span class='cell {s}'>{_GLYPH.get(s, '')}"
         f"</span> {label}</span>" for s, label in items)
     return f"<div class='legend'>{cells}</div>"
 
@@ -246,9 +268,8 @@ def _matrix(data):
         tds = []
         for d in dates:
             state, tip = _cell(data, slug, d)
-            glyph = "&times;" if state == FAILED else ""
             tds.append(f"<td><span class='cell {state}' data-tip=\"{html.escape(tip)}\">"
-                       f"{glyph}</span></td>")
+                       f"{_GLYPH.get(state, '')}</span></td>")
         rows.append(f"<tr><th class='slug'>{html.escape(slug)}</th>{''.join(tds)}</tr>")
     return f"<div class='scroll'><table class='matrix'>{''.join(rows)}</table></div>"
 
@@ -258,13 +279,14 @@ def _calendar(data):
     # Per-day tallies across all cities.
     tallies = {}
     for d in data["dates"]:
-        n = u = f = 0
+        n = u = f = x = 0
         for slug in data["slugs"]:
             state, _ = _cell(data, slug, d)
             if state == NEW: n += 1
             elif state == UNCHANGED: u += 1
             elif state == FAILED: f += 1
-        tallies[d] = (n, u, f, total - n - u - f)
+            elif state == REFUSED: x += 1
+        tallies[d] = (n, u, f, x, total - n - u - f - x)
 
     months = {}  # "YYYY-MM" -> [iso dates]
     for d in data["dates"]:
@@ -279,14 +301,16 @@ def _calendar(data):
                    ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"))
         out.extend("<div></div>" * first.weekday())  # pad to the first date shown
         for d in ds:
-            n, u, f, m = tallies[d]
-            tip = (f"{d}: {n} new, {u} unchanged, {f} failed, {m} no attempt "
-                   f"(of {n + u + f + m})")
+            n, u, f, x, m = tallies[d]
+            tip = (f"{d}: {n} new, {u} unchanged, {f} failed, {x} refused, "
+                   f"{m} no attempt (of {n + u + f + x + m})")
             bar = "".join(
                 f"<i class='{cls}' style='flex:{v}'></i>"
-                for cls, v in ((NEW, n), (UNCHANGED, u), (FAILED, f), (MISSING, m)) if v)
-            summary = f"<span class='bad'>{f}&times;</span>" if f else \
-                      (f"{n + u}&#10003;" if n + u else "&mdash;")
+                for cls, v in ((NEW, n), (UNCHANGED, u), (FAILED, f),
+                               (REFUSED, x), (MISSING, m)) if v)
+            summary = f"<span class='warnct'>{x}!</span>" if x else \
+                      (f"<span class='bad'>{f}&times;</span>" if f else
+                       (f"{n + u}&#10003;" if n + u else "&mdash;"))
             today = " today" if d == data["today"] else ""
             out.append(
                 f"<div class='day{today}' data-tip='{html.escape(tip)}'>"
@@ -348,6 +372,22 @@ def _growth(st):
 
 def _failures(data):
     out = []
+    # First, because it is the only part of this section that needs a person:
+    # nothing here clears itself the way an unreachable source does.
+    if data["standing"]:
+        out.append(f"<h3 class='needs'>Refused — needs a look "
+                   f"({len(data['standing'])})</h3>")
+        out.append("<p class='sub'>The source answered and the data was thrown away. "
+                   "Either it is serving damage, or it really did change this much. "
+                   "Nothing is recorded for these days until one or the other is "
+                   "settled; a pull that passes clears the state by itself.</p>")
+        out.append("<table class='fails refused'><tr><th>city</th><th>day</th>"
+                   "<th>when</th><th>reason</th></tr>")
+        for slug, d, detail, at in data["standing"]:
+            out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d or '')}</td>"
+                       f"<td>{html.escape((at or '')[:16])}</td>"
+                       f"<td class='err'>{html.escape(detail)}</td></tr>")
+        out.append("</table>")
     if data["current"]:
         out.append(f"<h3>Cities whose last pull failed ({len(data['current'])})</h3>")
         out.append("<table class='fails'><tr><th>city</th><th>day</th>"
@@ -362,11 +402,14 @@ def _failures(data):
     out.append("<h3>Failure log</h3>")
     if data["log"]:
         out.append("<table class='fails'><tr><th>city</th><th>day</th>"
-                   "<th>when</th><th>error</th></tr>")
+                   "<th>when</th><th>what</th><th>error</th></tr>")
         for r in data["log"]:
-            out.append(f"<tr><td>{html.escape(r['slug'])}</td>"
+            refused = r["state"] == "refused"
+            out.append(f"<tr{' class=refused' if refused else ''}>"
+                       f"<td>{html.escape(r['slug'])}</td>"
                        f"<td>{html.escape(r['date'] or '')}</td>"
                        f"<td>{html.escape((r['created_at'] or '')[:16])}</td>"
+                       f"<td>{'refused' if refused else 'failed'}</td>"
                        f"<td class='err'>{html.escape(r['detail'] or '')}</td></tr>")
         out.append("</table>")
     else:
@@ -381,6 +424,9 @@ _CSS = """<style>
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e;
   --muted: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,.10);
   --good: #0ca30c; --good-wash: rgba(12,163,12,.22); --bad: #d03b3b;
+  /* "refused" is not a worse "failed", it is a different thing: amber reads as
+     attention-wanted next to red's something-broke. */
+  --warn: #c07800; --warn-wash: rgba(192,120,0,.16);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -388,6 +434,7 @@ _CSS = """<style>
     --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7;
     --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,.10);
     --good-wash: rgba(12,163,12,.30);
+    --warn: #e2a03f; --warn-wash: rgba(226,160,63,.20);
   }
 }
 * { box-sizing: border-box; }
@@ -409,6 +456,7 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
 .cell.new { background: var(--good); }
 .cell.unchanged { background: var(--good-wash); border: 1px solid var(--good); }
 .cell.failed { background: var(--bad); color: #fff; font-weight: 700; }
+.cell.refused { background: var(--warn); color: #fff; font-weight: 700; }
 .cell.missing { border: 1px solid var(--grid); }
 .scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; padding: 10px; }
@@ -435,8 +483,10 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
 .bar i { display: block; }
 .bar .new { background: var(--good); } .bar .unchanged { background: var(--good-wash); }
 .bar .failed { background: var(--bad); } .bar .missing { background: var(--grid); }
+.bar .refused { background: var(--warn); }
 .ct { font-size: 10px; color: var(--ink2); font-variant-numeric: tabular-nums; }
 .ct .bad { color: var(--bad); font-weight: 600; }
+.ct .warnct { color: var(--warn); font-weight: 700; }
 .tiers { display: flex; height: 22px; gap: 2px; border-radius: 6px; overflow: hidden;
   background: var(--surface); border: 1px solid var(--border); }
 .tiers i { display: block; }
@@ -462,6 +512,9 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
   vertical-align: top; }
 .fails td.err { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
   color: var(--ink2); word-break: break-all; }
+h3.needs { color: var(--warn); }
+.fails.refused { border-color: var(--warn); border-left: 3px solid var(--warn); }
+.fails tr.refused td { background: var(--warn-wash); }
 #tip { position: fixed; z-index: 9; background: var(--ink); color: var(--page);
   padding: 5px 9px; border-radius: 6px; font-size: 12px; max-width: 380px;
   pointer-events: none; }

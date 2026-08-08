@@ -28,6 +28,14 @@ RETRY_WAIT = 900
 COUNT_TOLERANCE = 0.01
 
 
+class DegradedPull(ValueError):
+    """The pull arrived, and is not trustworthy: the transport worked but what
+    came back does not describe the layer. Kept apart from an ordinary fetch
+    error because the two want different responses -- a timeout resolves itself
+    on the next run, while this one is either a source that has started serving
+    damaged data or a real change big enough that somebody should look."""
+
+
 def _json(r):
     """Parse a response, rejecting the error bodies ArcGIS serves under HTTP 200.
 
@@ -170,8 +178,8 @@ def fetch(source, dest_dir, *, force=False, today=None):
     # paged are normal, and the OID window has already skipped any that landed
     # behind us.
     if expected is not None and len(features) < expected * (1 - COUNT_TOLERANCE):
-        raise ValueError(f"truncated pull: {len(features):,} features, "
-                         f"layer reports {expected:,}")
+        raise DegradedPull(f"truncated pull: {len(features):,} features, "
+                           f"layer reports {expected:,}")
 
     tmp = filepath + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

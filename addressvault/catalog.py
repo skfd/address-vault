@@ -46,10 +46,12 @@ CREATE TABLE IF NOT EXISTS leases(
 """
 
 # A lease is finished once its writer stops: it succeeded ("done"), the source
-# failed ("failed"), or the link went down under it ("deferred" -- no attempt to
-# hold against the source). Any other state is live. Shared with
-# ``PullStatus.active``: a state missing here leaves the slug wedged.
-TERMINAL_STATES = ("done", "failed", "deferred")
+# failed ("failed"), the data came back untrustworthy and was thrown away
+# ("refused" -- see fetch.DegradedPull), or the link went down under it
+# ("deferred" -- no attempt to hold against the source). Any other state is
+# live. Shared with ``PullStatus.active``: a state missing here leaves the slug
+# wedged.
+TERMINAL_STATES = ("done", "failed", "refused", "deferred")
 
 _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",

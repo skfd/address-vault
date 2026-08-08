@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from addressvault import archive, config, net
+from addressvault import fetch as fetch_mod
 from addressvault.catalog import TERMINAL_STATES, Catalog
 from addressvault.fetch import fetch
 from addressvault.sources import Source
@@ -255,6 +256,14 @@ class Vault:
             # reclaim the slug -- but the report reads failed *leases* as the
             # freshest error it has, and would repaint that same red cell.
             self.cat.set_lease_state(slug, "deferred", detail=str(e))
+            raise
+        except fetch_mod.DegradedPull as e:
+            # The source answered; what it sent is not usable. Recorded apart
+            # from "failed" all the way to the report, because a human has to
+            # decide which it is -- a source serving damage, or a change big
+            # enough to look like damage -- and nothing here can decide it.
+            self.cat.record_job("pull", slug, day, "refused", detail=str(e))
+            self.cat.set_lease_state(slug, "refused", detail=str(e))
             raise
         except Exception as e:
             self.cat.record_job("pull", slug, day, "failed", detail=str(e))

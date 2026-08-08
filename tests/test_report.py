@@ -100,6 +100,54 @@ def test_a_link_that_died_mid_fetch_is_no_attempt_not_a_failure(vault, monkeypat
     assert "No city is currently in a failed state." in page
 
 
+def test_a_refused_pull_is_not_shown_as_an_ordinary_failure(vault, monkeypatch):
+    from datetime import date
+
+    from addressvault.fetch import DegradedPull
+    from addressvault.sources import Source
+    # A source that answers with damaged data is a different problem from one
+    # that cannot be reached: nobody has to do anything about a timeout, and
+    # somebody has to decide about this.
+    vault.add_source(Source(slug="t", provider="T", data_url="http://x/0",
+                            access="arcgis", format="geojson"))
+    monkeypatch.setattr(
+        "addressvault.fetch.arcgis.fetch",
+        lambda *a, **k: (_ for _ in ()).throw(
+            DegradedPull("truncated pull: 20,000 features, layer reports 38,300")))
+    with pytest.raises(DegradedPull):
+        vault.pull("t", today="2026-01-01")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert ("t", "2026-01-01") in data["refused"]
+    assert ("t", "2026-01-01") not in data["fails"]   # never counted as a failure
+    assert data["current"] == [] and len(data["standing"]) == 1
+    assert report._cell(data, "t", "2026-01-01")[0] == report.REFUSED
+
+    page = open(report.build(vault, days=7, today=date(2026, 1, 2)), encoding="utf-8").read()
+    assert "Refused &mdash; needs a look (1)" in page or "Refused — needs a look (1)" in page
+    assert "layer reports 38,300" in page
+    assert "No city is currently in a failed state." in page  # the red list stays empty
+
+    # ...and the lease must still be terminal, or the slug is wedged for good
+    assert not vault.pull_status("t").active
+
+
+def test_a_refusal_clears_when_the_source_recovers(vault, http_dir):
+    from datetime import date
+
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    vault.cat.record_job("pull", "t", "2026-01-01", "refused", detail="truncated pull")
+    vault.cat.set_lease_state("t", "refused", detail="truncated pull")
+
+    vault.pull("t", today="2026-01-02")
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert data["standing"] == [], "a good pull takes the city off the needs-a-look list"
+    # the day it happened keeps its amber cell; the log is history, not a to-do
+    assert report._cell(data, "t", "2026-01-01")[0] == report.REFUSED
+
+
 def test_build_writes_storage_section(vault, http_dir):
     base, d = http_dir
     write_geojson(d, "addr.geojson", 3)
