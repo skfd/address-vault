@@ -31,10 +31,11 @@ def _page(*oids):
         for o in oids]}
 
 
-def _one_page(monkeypatch):
+def _one_page(monkeypatch, expected=2):
     """Two features, then an empty page -- the shortest complete pagination."""
     pages = iter([_page(1, 2), _page()])
     monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: expected)
 
 
 def test_metadata_blip_is_retried_not_fatal(tmp_path, monkeypatch):
@@ -113,10 +114,40 @@ def test_an_error_body_under_http_200_is_not_a_layer(tmp_path, monkeypatch):
 def test_an_empty_first_page_fails_instead_of_writing_an_empty_snapshot(
         tmp_path, monkeypatch):
     monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: None)
     monkeypatch.setattr(arcgis, "_query", lambda s, u, p: _page())
     with pytest.raises(ValueError, match="first page returned no features"):
         arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_pull_that_stops_short_of_the_layer_count_fails(tmp_path, monkeypatch):
+    # kitchener 2026-07-28: a blank page arrived mid-stream, ended the paging
+    # loop, and 102,000 of 131,912 addresses were recorded as the whole city.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    _one_page(monkeypatch, expected=50)
+    with pytest.raises(ValueError, match=r"truncated pull: 2 features, layer reports 50"):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_layer_that_reports_no_count_is_still_pulled(tmp_path, monkeypatch):
+    # Unverifiable is the guarantee we had before the probe, not a new failure.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    _one_page(monkeypatch, expected=None)
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 2
+
+
+def test_rows_deleted_while_paging_stay_inside_the_tolerance(tmp_path, monkeypatch):
+    # The count is probed before paging starts, so a live layer can shed a few
+    # rows underneath us; that is not a truncated pull.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: dict(META, maxRecordCount=500))
+    pages = iter([_page(*range(1, 298)), _page()])
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 300)  # 1% of 300 == 3
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 297
 
 
 def test_a_down_link_surfaces_as_link_unavailable_without_burning_retries(

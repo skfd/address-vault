@@ -22,6 +22,10 @@ DEFAULT_PAGE = 2000
 # resume from last_oid instead of failing the whole city.
 RETRIES = 3
 RETRY_WAIT = 900
+# How far below the layer's own reported count a pull may land before we call it
+# truncated. Not zero: the layer keeps being edited while we page it, so a few
+# rows can legitimately disappear between the count probe and the last page.
+COUNT_TOLERANCE = 0.01
 
 
 def _json(r):
@@ -46,6 +50,25 @@ def _layer_meta(session, url):
 
 def _query(session, url, params):
     return _json(session.get(url + "/query", params=params, timeout=TIMEOUT))
+
+
+def _count(session, url):
+    """The layer's own row count, or None if it will not report one.
+
+    This is the only independent measure of how big the pull should be: the
+    paging loop below cannot tell a layer that ended from a page that came back
+    blank by accident (kitchener 2026-07-28 stopped at 102,000 of 131,912, huron
+    at 20,000 of 38,300 -- both exact multiples of the page size). A layer that
+    refuses the query is left unchecked rather than failed; that is the older,
+    weaker guarantee, not a new failure."""
+    try:
+        body = _query(session, url, {"where": "1=1", "returnCountOnly": "true",
+                                     "f": "json"})
+    except ValueError as e:  # error body under HTTP 200: query unsupported here
+        print(f"  count probe rejected ({e}); pull size cannot be verified")
+        return None
+    n = body.get("count")
+    return n if isinstance(n, int) else None
 
 
 def _esri_to_geojson(esri):
@@ -93,9 +116,13 @@ def fetch(source, dest_dir, *, force=False, today=None):
 
     # The metadata call draws on the same budget as a page: it is just as
     # droppable, and a blip on this first request used to cost the whole city.
+    # The count probe rides along in the same attempt -- it is the same kind of
+    # cheap pre-flight request, and it is worthless if a blip is allowed to skip
+    # it, since an unverified pull is exactly what we are trying to stop.
     while True:
         try:
             meta = _layer_meta(session, source.data_url)
+            expected = _count(session, source.data_url)
             break
         except (requests.ConnectionError, requests.Timeout) as e:
             _pause(e, f"{source.slug} metadata unreachable")
@@ -104,7 +131,8 @@ def fetch(source, dest_dir, *, force=False, today=None):
     can_geojson = "geoJSON" in (meta.get("supportedQueryFormats") or "")
     fmt = "geojson" if can_geojson else "json"
     oid_field = meta.get("objectIdField") or "OBJECTID"
-    print(f"  querying {source.slug} (page={page}, f={fmt}, oid={oid_field})")
+    print(f"  querying {source.slug} (page={page}, f={fmt}, oid={oid_field}"
+          f"{f', expect={expected:,}' if expected is not None else ''})")
 
     features = []
     last_oid = -1
@@ -135,6 +163,15 @@ def fetch(source, dest_dir, *, force=False, today=None):
         if len(batch) < page:
             break
     print()
+
+    # A pull that stopped early is indistinguishable from a complete one once
+    # written, and downstream reads it as the city losing tens of thousands of
+    # addresses overnight. Only the short side is checked: rows added while we
+    # paged are normal, and the OID window has already skipped any that landed
+    # behind us.
+    if expected is not None and len(features) < expected * (1 - COUNT_TOLERANCE):
+        raise ValueError(f"truncated pull: {len(features):,} features, "
+                         f"layer reports {expected:,}")
 
     tmp = filepath + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
