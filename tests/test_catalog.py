@@ -18,6 +18,34 @@ def test_source_roundtrip(tmp_path):
     assert len(cat.list_sources()) == 1
 
 
+def test_an_existing_vault_gains_columns_added_later(tmp_path):
+    """``CREATE TABLE IF NOT EXISTS`` leaves a built table alone, so opening an
+    older vault has to add the columns it predates -- with its rows intact and
+    NULL where it never had a value."""
+    import sqlite3
+
+    path = config.db_path(str(tmp_path))
+    old = sqlite3.connect(path)  # a vault built before `sketch` existed
+    old.executescript("""
+        CREATE TABLE snapshots(
+          slug TEXT, date TEXT, sha256 TEXT, features INTEGER, bytes INTEGER,
+          src_last_modified TEXT, src_content_length INTEGER,
+          on_disk INTEGER, archived INTEGER, restored_until TEXT,
+          unchanged_since TEXT, fetched_at TEXT, PRIMARY KEY(slug, date));
+        INSERT INTO snapshots (slug, date, features) VALUES ('t','2026-01-01',7);
+    """)
+    old.commit()
+    old.close()
+
+    cat = Catalog(path)
+    cols = {r["name"] for r in cat.conn.execute("PRAGMA table_info(snapshots)")}
+    assert "sketch" in cols
+    row = cat.get_snapshot("t", "2026-01-01")
+    assert row["features"] == 7 and row["sketch"] is None
+
+    Catalog(path)  # opening again must not try to add it twice
+
+
 def test_snapshot_query_and_flags(tmp_path):
     cat = _cat(tmp_path)
     for day in ("2026-01-01", "2026-01-02", "2026-01-03"):

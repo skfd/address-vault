@@ -108,12 +108,34 @@ and growth per tier including catalog-vs-disk drift, the **Large changes** list,
 and the failure log. It defaults to `<vault>/report.html`; open it in a browser,
 no server involved.
 
-**Large changes** is the operator's cue to look at a city. A day lands there when
-its feature count moved ≥2% from the previous snapshot, or when its byte count
-diverged ≥2% from its feature count — the second catches a source rewriting rows
-in place, which a count-only check cannot see at all. Both thresholds sit in a
-wide empty band: across the vault's own history the largest *legitimate*
-day-over-day feature change was 0.63%.
+**Large changes** is the operator's cue to look at a city. A day lands there when,
+against the previous snapshot, any of three things moved ≥2%:
+
+| test | catches | needs |
+| --- | --- | --- |
+| feature count | a city gaining or losing addresses wholesale | nothing — retroactive over all history |
+| bytes vs. features | rows rewritten in place, which a count-only check cannot see | nothing — retroactive |
+| addresses rewritten | a rewrite that holds size *and* count steady | a stored sketch, so forward-only |
+
+The thresholds sit in a wide empty band: across the vault's own history the
+largest *legitimate* day-over-day feature change was 0.63%.
+
+The third test exists because the first two are scalars, and a source can rename
+every street to an equal-length name, or re-geocode every point, without moving
+either number. Each pull reduces its snapshot to an 8 KB **bottom-k sketch** —
+the 1,024 smallest hashes of its addresses — so the report compares 8 KB against
+8 KB and recovers the fraction of addresses that changed, without ever reading
+two snapshots at once. Reducing a 448 MB snapshot costs about eight seconds,
+against a pull that just downloaded it.
+
+What is hashed is the address each source *declares* (its `[fields]` map, plus
+the coordinate rounded to ~0.1 m), not the whole feature. Sources republish
+churning metadata — brant regenerates every `GLOBALID` and shifts every
+`CREATED_DATE` daily without moving a single address — so hashing whole features
+would report 100% churn every morning and be worthless.
+
+A snapshot pulled before sketching existed stores no sketch, and a day the vault
+cannot measure is reported as unmeasured rather than as quiet.
 
 This is a flag, not a gate. Unlike a refused pull (which records nothing, because
 the data provably is not what the source holds), a flagged day **is** what the

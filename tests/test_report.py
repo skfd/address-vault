@@ -8,10 +8,24 @@ from addressvault import config, report
 from conftest import write_geojson
 
 
-def _add(vault, base, name="addr.geojson"):
+def _add(vault, base, name="addr.geojson", fields=None):
     from addressvault.sources import Source
     vault.add_source(Source(slug="t", provider="T", data_url=f"{base}/{name}",
-                            access="static", format="geojson"))
+                            access="static", format="geojson",
+                            fields=fields or {}))
+
+
+ADDR_FIELDS = {"number": "NUM", "street": "ST"}
+
+
+def _write_addresses(d, n, street="MAIN STREET", name="addr.geojson", **extra):
+    """An n-address layer whose size depends only on the *length* of what it
+    says, so a same-length rewrite is byte-for-byte identical."""
+    (d / name).write_text(json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature",
+         "properties": {"NUM": f"{i:05d}", "ST": street, **extra},
+         "geometry": {"type": "Point", "coordinates": [float(i), 43.0]}}
+        for i in range(n)]}))
 
 
 def _storage(vault, days=7, today="2026-01-02"):
@@ -271,6 +285,91 @@ def test_build_writes_large_changes_section(vault, http_dir):
     assert "-50.0% features" in page
     # a large change is not a failure, and must not be reported as one
     assert "No city is currently in a failed state." in page
+
+
+def test_a_rewrite_that_moves_neither_count_nor_bytes_is_flagged(vault, http_dir):
+    """The case both scalar tests are blind to, end to end.
+
+    Every street renamed to an equal-length name: the city has the same number
+    of addresses, in a file of exactly the same size, and none of them are the
+    addresses it had yesterday.
+    """
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 400, street="MAIN STREET")
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    _write_addresses(d, 400, street="OAKS AVENUE")
+    # Forced because a byte-neutral rewrite republished within the same second
+    # is invisible to the static path's HEAD cache -- same Content-Length, same
+    # Last-Modified. Real pulls are a day apart; only the test is that quick.
+    vault.pull("t", today="2026-01-02", force=True)
+
+    a, b = vault.snapshot("t", "2026-01-01"), vault.snapshot("t", "2026-01-02")
+    assert (a.features, a.bytes) == (b.features, b.bytes)  # scalars see nothing
+    assert a.sha256 != b.sha256                            # yet it is a new file
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    why = data["spikes"][("t", "2026-01-02")]
+    assert "100.0% of addresses rewritten" in why
+    assert report._cell(data, "t", "2026-01-02")[0] == report.SPIKED
+
+
+def test_republished_metadata_alone_is_not_flagged(vault, http_dir):
+    """A source that regenerates per-row ids and timestamps daily without
+    touching an address (brant does exactly this) must stay quiet, or the flag
+    is noise every morning for the cities that need it most."""
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 400, GLOBALID="aaaaaaaa", CREATED="1786170236828")
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    _write_addresses(d, 400, GLOBALID="zzzzzzzz", CREATED="1786256402135")
+    vault.pull("t", today="2026-01-02", force=True)  # see the note above
+
+    a, b = vault.snapshot("t", "2026-01-01"), vault.snapshot("t", "2026-01-02")
+    assert a.sha256 != b.sha256  # a genuinely different file was published
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert data["spikes"] == {}
+    assert report._cell(data, "t", "2026-01-02")[0] == report.NEW
+
+
+def test_a_dedup_day_carries_the_sketch_forward(vault, http_dir):
+    """A dedup day stores no sketch of its own, so it has to inherit one -- or
+    the day after it has no baseline and the next real rewrite goes unseen."""
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 400, street="MAIN STREET")
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    vault.pull("t", today="2026-01-02")          # identical -> dedup pointer
+    _write_addresses(d, 400, street="OAKS AVENUE")
+    vault.pull("t", today="2026-01-03", force=True)  # see the note above
+
+    row = vault.cat.get_snapshot("t", "2026-01-02")
+    assert row["unchanged_since"] == "2026-01-01" and row["sketch"]
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 3))
+    assert "100.0% of addresses rewritten" in data["spikes"][("t", "2026-01-03")]
+
+
+def test_a_day_pulled_before_sketching_is_not_read_as_quiet(vault, http_dir):
+    """Sketches only exist going forward. A missing one means "cannot say", and
+    must not be mistaken for "nothing moved"."""
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 400, street="MAIN STREET")
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    vault.cat.set_snapshot("t", "2026-01-01", sketch=None)  # as an old row is
+    _write_addresses(d, 400, street="OAKS AVENUE")
+    vault.pull("t", today="2026-01-02", force=True)  # see the note above
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert data["spikes"] == {}  # unseeable, not silently declared fine
 
 
 def test_build_writes_storage_section(vault, http_dir):

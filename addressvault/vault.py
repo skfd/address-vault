@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from addressvault import archive, config, net
 from addressvault import fetch as fetch_mod
+from addressvault import sketch as sketch_mod
 from addressvault.catalog import TERMINAL_STATES, Catalog
 from addressvault.fetch import fetch
 from addressvault.sources import Source
@@ -114,6 +115,11 @@ def _sha256(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _sketch(path, fields):
+    """The snapshot's address fingerprint, ready to store (see ``sketch``)."""
+    return sketch_mod.encode(sketch_mod.of_file(path, fields))
 
 
 def _src_from_row(row):
@@ -295,6 +301,10 @@ class Vault:
                 src_content_length=headers.get("content_length"),
                 on_disk=0, archived=0, restored_until=None,
                 unchanged_since=canon, fetched_at=_now(),
+                # Identical content: the canonical day's sketch is this day's
+                # too, and carrying it forward keeps consecutive rows
+                # comparable without re-reading a file we did not rewrite.
+                sketch=prior["sketch"],
             )
         else:
             if path != today_path:  # static reused an existing file; materialise today's
@@ -306,6 +316,7 @@ class Vault:
                 src_content_length=headers.get("content_length"),
                 on_disk=1, archived=0, restored_until=None,
                 unchanged_since=None, fetched_at=_now(),
+                sketch=_sketch(today_path, src.fields),
             )
         self.cat.record_job("pull", slug, day, "done")
         self.cat.set_lease_state(slug, "done")

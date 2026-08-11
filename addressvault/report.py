@@ -21,7 +21,7 @@ import os
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
-from addressvault import archive, config
+from addressvault import archive, config, sketch
 
 # Cell states, in legend order.
 NEW, SPIKED, UNCHANGED, FAILED, REFUSED, MISSING = \
@@ -39,6 +39,12 @@ SPIKE_FEATURES = 0.02
 # divergence from the feature change, so ordinary growth, where the two move
 # together, stays quiet.
 SPIKE_DIVERGENCE = 0.02
+# The share of a city's addresses that may be rewritten in a day before it wants
+# a person -- the churn a rewrite holding both count *and* size steady would
+# otherwise hide. Held at the same 2% as the other two so the three tests draw
+# one line; the sketch reads a true 2% as ~1.7%, so this fires a shade late
+# rather than early, which is the right way round for a flag nobody can dismiss.
+SPIKE_CHURN = 0.02
 
 
 def build(vault, days=42, out=None, today=None):
@@ -113,11 +119,14 @@ def _spike(p, r):
     """Why day ``r``'s content is a spike against the previous snapshot ``p``,
     or None if it moved no more than a city normally does in a day.
 
-    Two shapes of one question. The feature count moving is a city gaining or
+    Three shapes of one question. The feature count moving is a city gaining or
     losing addresses wholesale. The byte count moving while the feature count
     holds still is a source rewriting rows in place; it is measured as the gap
     between the two, so ordinary growth -- where bytes and rows move together --
-    says nothing.
+    says nothing. Both are scalars, and a rewrite that holds size as well as
+    count slips past them: the sketch comparison is what sees that one, and it
+    is checked last because it is the only test that needs a stored fingerprint
+    and so is blind to days pulled before sketching existed.
     """
     if not p["features"]:
         # No baseline to be relative to: the previous day recorded nothing. Any
@@ -129,12 +138,15 @@ def _spike(p, r):
     if abs(df) >= SPIKE_FEATURES:
         return (f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
                 f"(since {p['date']})")
-    if not p["bytes"]:
-        return None
-    db = (r["bytes"] - p["bytes"]) / p["bytes"]
-    if abs(db - df) >= SPIKE_DIVERGENCE:
-        return (f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
-                f"place, not added or dropped (since {p['date']})")
+    if p["bytes"]:
+        db = (r["bytes"] - p["bytes"]) / p["bytes"]
+        if abs(db - df) >= SPIKE_DIVERGENCE:
+            return (f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
+                    f"place, not added or dropped (since {p['date']})")
+    rewritten = sketch.churn(sketch.decode(p["sketch"]), sketch.decode(r["sketch"]))
+    if rewritten is not None and rewritten >= SPIKE_CHURN:
+        return (f"{rewritten:.1%} of addresses rewritten on {df:+.1%} features "
+                f"and no size change to show for it (since {p['date']})")
     return None
 
 
@@ -150,13 +162,14 @@ def _churn(cat, frm):
     an archive exists to keep.
 
     Each day is compared against the snapshot before it, not against the same
-    date last week: dedup days carry the canonical day's ``features``/``bytes``
-    forward, so consecutive rows differ only where the content actually did.
+    date last week: dedup days carry the canonical day's ``features``, ``bytes``
+    and ``sketch`` forward, so consecutive rows differ only where the content
+    actually did.
     """
     rows = cat.conn.execute(
         # Every row in the window, plus the one immediately before it per slug
         # -- the first day shown needs a baseline too.
-        "SELECT slug, date, features, bytes FROM snapshots WHERE date>=? OR "
+        "SELECT slug, date, features, bytes, sketch FROM snapshots WHERE date>=? OR "
         "date=(SELECT MAX(date) FROM snapshots p WHERE p.slug=snapshots.slug "
         "AND p.date<?) ORDER BY slug, date", (frm, frm)
     ).fetchall()

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS snapshots(
   sha256 TEXT, features INTEGER, bytes INTEGER,
   src_last_modified TEXT, src_content_length INTEGER,
   on_disk INTEGER, archived INTEGER, restored_until TEXT,
-  unchanged_since TEXT, fetched_at TEXT,
+  unchanged_since TEXT, fetched_at TEXT, sketch BLOB,
   PRIMARY KEY(slug, date)
 );
 CREATE TABLE IF NOT EXISTS jobs(
@@ -57,7 +57,13 @@ _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",
     "src_last_modified", "src_content_length",
     "on_disk", "archived", "restored_until", "unchanged_since", "fetched_at",
+    "sketch",
 )
+
+# Columns added to `snapshots` after the first vaults were built. SCHEMA above
+# creates them for a new vault; an existing one gets them here. Both paths must
+# agree, so a column added there needs a line here too.
+_ADDED_COLS = (("sketch", "BLOB"),)
 
 
 def _now():
@@ -74,6 +80,20 @@ class Catalog:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        self._add_missing_columns()
+
+    def _add_missing_columns(self):
+        """Bring an existing vault's `snapshots` up to SCHEMA.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an already-built table alone, so a
+        new column has to be added explicitly. Older rows keep NULL, which every
+        reader already has to handle -- a snapshot pulled before the column
+        existed genuinely has no value for it.
+        """
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(snapshots)")}
+        for col, decl in _ADDED_COLS:
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col} {decl}")
 
     def close(self):
         self.conn.close()
