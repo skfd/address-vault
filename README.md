@@ -103,9 +103,25 @@ addressvault report [--out PATH] [--days N]            # self-contained HTML sta
 ```
 
 `report` renders one static HTML file from the catalog — a city × day matrix
-(new / unchanged / failed / no attempt), a month calendar, storage and growth
-per tier including catalog-vs-disk drift, and the failure log. It defaults to
-`<vault>/report.html`; open it in a browser, no server involved.
+(new / large change / unchanged / failed / no attempt), a month calendar, storage
+and growth per tier including catalog-vs-disk drift, the **Large changes** list,
+and the failure log. It defaults to `<vault>/report.html`; open it in a browser,
+no server involved.
+
+**Large changes** is the operator's cue to look at a city. A day lands there when
+its feature count moved ≥2% from the previous snapshot, or when its byte count
+diverged ≥2% from its feature count — the second catches a source rewriting rows
+in place, which a count-only check cannot see at all. Both thresholds sit in a
+wide empty band: across the vault's own history the largest *legitimate*
+day-over-day feature change was 0.63%.
+
+This is a flag, not a gate. Unlike a refused pull (which records nothing, because
+the data provably is not what the source holds), a flagged day **is** what the
+source served — it is recorded, and consumers read it normally. The vault raises
+the question because it is the only place that can ask it cheaply; it must not
+answer it by discarding the day, since a genuine 30% change is exactly what an
+archive exists to keep. Deciding whether consumers need reimporting is the
+operator's call.
 
 ## Scheduling
 

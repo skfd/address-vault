@@ -1,11 +1,12 @@
 """Static HTML status report: what the vault holds, per city per day.
 
 ``addressvault report`` renders one self-contained HTML file from the catalog --
-no server, open it in a browser. Four views:
+no server, open it in a browser. Five views:
 
 * a city x day matrix (new data / pulled-but-unchanged / failed / no attempt),
 * a month calendar of per-day totals (the "did the scheduler run" view),
 * storage: real bytes on disk per tier, daily growth, and catalog-vs-disk drift,
+* the days whose content moved far enough that somebody should look,
 * the failure log (durable ``jobs`` rows plus each city's current lease state).
 
 "Failed" for a past day is only as good as the job log: failures are recorded
@@ -17,13 +18,27 @@ the cold figure is therefore the repo's size on disk, not its dedup ratio.
 
 import html
 import os
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 from addressvault import archive, config
 
 # Cell states, in legend order.
-NEW, UNCHANGED, FAILED, REFUSED, MISSING = \
-    "new", "unchanged", "failed", "refused", "missing"
+NEW, SPIKED, UNCHANGED, FAILED, REFUSED, MISSING = \
+    "new", "spiked", "unchanged", "failed", "refused", "missing"
+
+# How far a day's content may move from the previous snapshot before the report
+# marks it and asks for a person. Calibrated against the vault's own history
+# (1,905 snapshots to 2026-08-10): the largest legitimate day-over-day feature
+# change was 0.63%, and nothing at all landed between 1% and 50%, so there is a
+# wide empty band to put the line in.
+SPIKE_FEATURES = 0.02
+# Bytes moving while the row count holds still is the other shape of the same
+# question -- a source rewriting rows in place rather than adding or dropping
+# them (muskoka 2026-07-01 grew 16.8% on a 0.000% feature change). Compared as a
+# divergence from the feature change, so ordinary growth, where the two move
+# together, stays quiet.
+SPIKE_DIVERGENCE = 0.02
 
 
 def build(vault, days=42, out=None, today=None):
@@ -89,9 +104,73 @@ def _collect(cat, root, days, today):
         "today": today.isoformat(),
         "dates": dates, "slugs": slugs, "snaps": snaps, "fails": fails,
         "refused": refused, "current": current, "standing": standing,
-        "log": log, "stats": cat.stats(),
+        "log": log, "stats": cat.stats(), "spikes": _churn(cat, frm),
         "storage": _storage(cat, root, dates),
     }
+
+
+def _spike(p, r):
+    """Why day ``r``'s content is a spike against the previous snapshot ``p``,
+    or None if it moved no more than a city normally does in a day.
+
+    Two shapes of one question. The feature count moving is a city gaining or
+    losing addresses wholesale. The byte count moving while the feature count
+    holds still is a source rewriting rows in place; it is measured as the gap
+    between the two, so ordinary growth -- where bytes and rows move together --
+    says nothing.
+    """
+    if not p["features"]:
+        # No baseline to be relative to: the previous day recorded nothing. Any
+        # content at all is a mass change against an empty snapshot.
+        if not r["features"]:
+            return None  # empty then, empty now -- nothing moved
+        return f"{r['features']:,} features, up from an empty snapshot ({p['date']})"
+    df = (r["features"] - p["features"]) / p["features"]
+    if abs(df) >= SPIKE_FEATURES:
+        return (f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
+                f"(since {p['date']})")
+    if not p["bytes"]:
+        return None
+    db = (r["bytes"] - p["bytes"]) / p["bytes"]
+    if abs(db - df) >= SPIKE_DIVERGENCE:
+        return (f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
+                f"place, not added or dropped (since {p['date']})")
+    return None
+
+
+def _churn(cat, frm):
+    """(slug, date) -> why that day's content moved far enough to want a person.
+
+    Deliberately not a pull-time guard. A ``DegradedPull`` refusal records
+    nothing because the data provably is not what the source holds; a day in
+    here *is* what the source served, so it is recorded and consumers can read
+    it normally. The vault raises the question because it is the only place that
+    can ask it cheaply -- it already holds every prior day -- but it must not
+    answer it by discarding the day, since a genuine 30% change is exactly what
+    an archive exists to keep.
+
+    Each day is compared against the snapshot before it, not against the same
+    date last week: dedup days carry the canonical day's ``features``/``bytes``
+    forward, so consecutive rows differ only where the content actually did.
+    """
+    rows = cat.conn.execute(
+        # Every row in the window, plus the one immediately before it per slug
+        # -- the first day shown needs a baseline too.
+        "SELECT slug, date, features, bytes FROM snapshots WHERE date>=? OR "
+        "date=(SELECT MAX(date) FROM snapshots p WHERE p.slug=snapshots.slug "
+        "AND p.date<?) ORDER BY slug, date", (frm, frm)
+    ).fetchall()
+
+    spikes, prev = {}, {}
+    for r in rows:
+        p = prev.get(r["slug"])
+        prev[r["slug"]] = r
+        if p is None or r["date"] < frm:
+            continue  # the pre-window baseline is a yardstick, not a finding
+        why = _spike(p, r)
+        if why:
+            spikes[(r["slug"], r["date"])] = why
+    return spikes
 
 
 def _storage(cat, root, dates):
@@ -181,6 +260,10 @@ def _cell(data, slug, d):
     if s is not None:
         tier = ("hot" if s["on_disk"] else "") + ("+cold" if s["archived"] else "")
         tier = tier.lstrip("+") or "recorded"
+        why = data["spikes"].get((slug, d))
+        if why:
+            return SPIKED, (f"{slug} {d}: LARGE CHANGE, recorded and readable -- "
+                            f"{why}. {_human_bytes(s['bytes'])} ({tier})")
         if s["unchanged_since"]:
             return UNCHANGED, (f"{slug} {d}: pulled, unchanged since "
                                f"{s['unchanged_since']} ({s['features']:,} features)")
@@ -217,6 +300,7 @@ def _render(data):
         "<h2>Pulls by city and day</h2>", _matrix(data),
         "<h2>Daily totals</h2>", _calendar(data),
         "<h2>Storage</h2>", _storage_section(data),
+        f"<h2>Large changes ({len(data['spikes'])})</h2>", _spikes(data),
         "<h2>Failures</h2>", _failures(data),
         "<div id='tip' hidden></div>", _JS, "</body></html>",
     ]
@@ -237,18 +321,23 @@ def _kpis(st):
     return f"<div class='kpis'>{cells}</div>"
 
 
-_GLYPH = {FAILED: "&times;", REFUSED: "!"}
+_GLYPH = {FAILED: "&times;", REFUSED: "!", SPIKED: "&#916;"}
+
+# Every state, in display order, with the terse label the calendar tooltip uses.
+# Legend, calendar bar, and tooltip all read their order from here so they
+# cannot drift apart as states are added.
+_STATES = [(NEW, "new"), (SPIKED, "large change"), (UNCHANGED, "unchanged"),
+           (FAILED, "failed"), (REFUSED, "refused"), (MISSING, "no attempt")]
+
+_LEGEND = {NEW: "new data", SPIKED: "large change — worth a look",
+           UNCHANGED: "pulled, unchanged", FAILED: "failed",
+           REFUSED: "refused — needs a look", MISSING: "no attempt"}
 
 
 def _legend():
-    items = [
-        (NEW, "new data"), (UNCHANGED, "pulled, unchanged"),
-        (FAILED, "failed"), (REFUSED, "refused — needs a look"),
-        (MISSING, "no attempt"),
-    ]
     cells = "".join(
         f"<span class='li'><span class='cell {s}'>{_GLYPH.get(s, '')}"
-        f"</span> {label}</span>" for s, label in items)
+        f"</span> {_LEGEND[s]}</span>" for s, _ in _STATES)
     return f"<div class='legend'>{cells}</div>"
 
 
@@ -277,16 +366,8 @@ def _matrix(data):
 def _calendar(data):
     total = len(data["slugs"])
     # Per-day tallies across all cities.
-    tallies = {}
-    for d in data["dates"]:
-        n = u = f = x = 0
-        for slug in data["slugs"]:
-            state, _ = _cell(data, slug, d)
-            if state == NEW: n += 1
-            elif state == UNCHANGED: u += 1
-            elif state == FAILED: f += 1
-            elif state == REFUSED: x += 1
-        tallies[d] = (n, u, f, x, total - n - u - f - x)
+    tallies = {d: Counter(_cell(data, slug, d)[0] for slug in data["slugs"])
+               for d in data["dates"]}
 
     months = {}  # "YYYY-MM" -> [iso dates]
     for d in data["dates"]:
@@ -301,16 +382,22 @@ def _calendar(data):
                    ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"))
         out.extend("<div></div>" * first.weekday())  # pad to the first date shown
         for d in ds:
-            n, u, f, x, m = tallies[d]
-            tip = (f"{d}: {n} new, {u} unchanged, {f} failed, {x} refused, "
-                   f"{m} no attempt (of {n + u + f + x + m})")
-            bar = "".join(
-                f"<i class='{cls}' style='flex:{v}'></i>"
-                for cls, v in ((NEW, n), (UNCHANGED, u), (FAILED, f),
-                               (REFUSED, x), (MISSING, m)) if v)
-            summary = f"<span class='warnct'>{x}!</span>" if x else \
-                      (f"<span class='bad'>{f}&times;</span>" if f else
-                       (f"{n + u}&#10003;" if n + u else "&mdash;"))
+            t = tallies[d]
+            tip = (f"{d}: " + ", ".join(f"{t[s]} {label}" for s, label in _STATES)
+                   + f" (of {total})")
+            bar = "".join(f"<i class='{s}' style='flex:{t[s]}'></i>"
+                          for s, _ in _STATES if t[s])
+            # Worst-first: whatever most wants a person is what the cell says.
+            if t[REFUSED]:
+                summary = f"<span class='warnct'>{t[REFUSED]}!</span>"
+            elif t[FAILED]:
+                summary = f"<span class='bad'>{t[FAILED]}&times;</span>"
+            elif t[SPIKED]:
+                summary = f"<span class='spikect'>{t[SPIKED]}&#916;</span>"
+            elif t[NEW] + t[UNCHANGED]:
+                summary = f"{t[NEW] + t[UNCHANGED]}&#10003;"
+            else:
+                summary = "&mdash;"
             today = " today" if d == data["today"] else ""
             out.append(
                 f"<div class='day{today}' data-tip='{html.escape(tip)}'>"
@@ -370,6 +457,26 @@ def _growth(st):
             f"<span>{list(st['added'])[-1]}</span></div></div>")
 
 
+def _spikes(data):
+    if not data["spikes"]:
+        return (f"<p class='sub'>No city's content moved by more than "
+                f"{SPIKE_FEATURES:.0%} in a day over this window.</p>")
+    out = ["<p class='sub'>These days are recorded and readable -- unlike a "
+           "refusal, nothing was thrown away, and consumers will pull them "
+           "normally. They are listed because the content moved far enough that "
+           "it is worth deciding whether the source published something wrong, "
+           "or whether it really did change this much and consumers need "
+           "reimporting.</p>",
+           "<table class='fails spikes'><tr><th>city</th><th>day</th>"
+           "<th>what moved</th></tr>"]
+    for (slug, d), why in sorted(data["spikes"].items(),
+                                 key=lambda kv: kv[0][1], reverse=True):
+        out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d)}</td>"
+                   f"<td class='err'>{html.escape(why)}</td></tr>")
+    out.append("</table>")
+    return "".join(out)
+
+
 def _failures(data):
     out = []
     # First, because it is the only part of this section that needs a person:
@@ -427,6 +534,10 @@ _CSS = """<style>
   /* "refused" is not a worse "failed", it is a different thing: amber reads as
      attention-wanted next to red's something-broke. */
   --warn: #c07800; --warn-wash: rgba(192,120,0,.16);
+  /* "spiked" is a third thing again -- the data is good and consumable, it just
+     moved a lot. Violet keeps it off the red/amber "something is wrong" scale
+     while still standing out from a wall of green. */
+  --spike: #7b5cd6; --spike-wash: rgba(123,92,214,.16);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -435,6 +546,7 @@ _CSS = """<style>
     --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,.10);
     --good-wash: rgba(12,163,12,.30);
     --warn: #e2a03f; --warn-wash: rgba(226,160,63,.20);
+    --spike: #a68cf0; --spike-wash: rgba(166,140,240,.20);
   }
 }
 * { box-sizing: border-box; }
@@ -457,6 +569,7 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
 .cell.unchanged { background: var(--good-wash); border: 1px solid var(--good); }
 .cell.failed { background: var(--bad); color: #fff; font-weight: 700; }
 .cell.refused { background: var(--warn); color: #fff; font-weight: 700; }
+.cell.spiked { background: var(--spike); color: #fff; font-weight: 700; }
 .cell.missing { border: 1px solid var(--grid); }
 .scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; padding: 10px; }
@@ -483,10 +596,11 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
 .bar i { display: block; }
 .bar .new { background: var(--good); } .bar .unchanged { background: var(--good-wash); }
 .bar .failed { background: var(--bad); } .bar .missing { background: var(--grid); }
-.bar .refused { background: var(--warn); }
+.bar .refused { background: var(--warn); } .bar .spiked { background: var(--spike); }
 .ct { font-size: 10px; color: var(--ink2); font-variant-numeric: tabular-nums; }
 .ct .bad { color: var(--bad); font-weight: 600; }
 .ct .warnct { color: var(--warn); font-weight: 700; }
+.ct .spikect { color: var(--spike); font-weight: 700; }
 .tiers { display: flex; height: 22px; gap: 2px; border-radius: 6px; overflow: hidden;
   background: var(--surface); border: 1px solid var(--border); }
 .tiers i { display: block; }
@@ -515,6 +629,7 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
 h3.needs { color: var(--warn); }
 .fails.refused { border-color: var(--warn); border-left: 3px solid var(--warn); }
 .fails tr.refused td { background: var(--warn-wash); }
+.fails.spikes { border-left: 3px solid var(--spike); }
 #tip { position: fixed; z-index: 9; background: var(--ink); color: var(--page);
   padding: 5px 9px; border-radius: 6px; font-size: 12px; max-width: 380px;
   pointer-events: none; }
