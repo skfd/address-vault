@@ -105,19 +105,26 @@ def _collect(cat, root, days, today):
         "ORDER BY created_at DESC LIMIT 100"
     ).fetchall()
 
+    spikes, unmeasured = _churn(cat, frm)
+
     return {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "today": today.isoformat(),
         "dates": dates, "slugs": slugs, "snaps": snaps, "fails": fails,
         "refused": refused, "current": current, "standing": standing,
-        "log": log, "stats": cat.stats(), "spikes": _churn(cat, frm),
-        "storage": _storage(cat, root, dates),
+        "log": log, "stats": cat.stats(), "spikes": spikes,
+        "unmeasured": unmeasured, "storage": _storage(cat, root, dates),
     }
 
 
 def _spike(p, r):
-    """Why day ``r``'s content is a spike against the previous snapshot ``p``,
-    or None if it moved no more than a city normally does in a day.
+    """``(why, blind)`` for day ``r`` against the previous snapshot ``p``.
+
+    ``why`` says how far the content moved, or is None if it moved no more than
+    a city normally does in a day. ``blind`` says the day cleared both scalar
+    tests but carries no sketch to run the third against, so its quiet is only
+    "nothing we could see moved" -- reported separately rather than counted as
+    a clean day.
 
     Three shapes of one question. The feature count moving is a city gaining or
     losing addresses wholesale. The byte count moving while the feature count
@@ -128,30 +135,47 @@ def _spike(p, r):
     is checked last because it is the only test that needs a stored fingerprint
     and so is blind to days pulled before sketching existed.
     """
+    if p["sha256"] and r["sha256"] == p["sha256"]:
+        # Byte-identical to the day before: nothing moved, and no fingerprint is
+        # needed to say so. Worth short-circuiting, or every dedup day reaching
+        # back past sketching would be reported unmeasured when it is provably
+        # unchanged.
+        return None, False
     if not p["features"]:
         # No baseline to be relative to: the previous day recorded nothing. Any
         # content at all is a mass change against an empty snapshot.
         if not r["features"]:
-            return None  # empty then, empty now -- nothing moved
-        return f"{r['features']:,} features, up from an empty snapshot ({p['date']})"
+            return None, False  # empty then, empty now -- nothing moved
+        return f"{r['features']:,} features, up from an empty snapshot ({p['date']})", False
     df = (r["features"] - p["features"]) / p["features"]
     if abs(df) >= SPIKE_FEATURES:
         return (f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
-                f"(since {p['date']})")
+                f"(since {p['date']})"), False
     if p["bytes"]:
         db = (r["bytes"] - p["bytes"]) / p["bytes"]
         if abs(db - df) >= SPIKE_DIVERGENCE:
             return (f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
-                    f"place, not added or dropped (since {p['date']})")
+                    f"place, not added or dropped (since {p['date']})"), False
+    if not p["sketch"] or not r["sketch"]:
+        return None, True  # the content changed and we cannot say by how much
     rewritten = sketch.churn(sketch.decode(p["sketch"]), sketch.decode(r["sketch"]))
-    if rewritten is not None and rewritten >= SPIKE_CHURN:
+    if rewritten >= SPIKE_CHURN:
         return (f"{rewritten:.1%} of addresses rewritten on {df:+.1%} features "
-                f"and no size change to show for it (since {p['date']})")
-    return None
+                f"and no size change to show for it (since {p['date']})"), False
+    return None, False
 
 
 def _churn(cat, frm):
-    """(slug, date) -> why that day's content moved far enough to want a person.
+    """``(spikes, unmeasured)``: which days moved far enough to want a person,
+    and which ones the vault could not finish asking about.
+
+    ``spikes`` maps (slug, date) -> why. ``unmeasured`` is the set of (slug,
+    date) whose content changed but whose rewrite share could not be measured,
+    because one side of the comparison predates sketching. They are held apart
+    from the quiet days rather than folded in with them: a report that cannot
+    tell "checked, nothing moved" from "never checked" is worth less than one
+    that admits the difference. A day with no predecessor at all is not in here
+    -- no test can run without a baseline, and the matrix already shows that.
 
     Deliberately not a pull-time guard. A ``DegradedPull`` refusal records
     nothing because the data provably is not what the source holds; a day in
@@ -169,21 +193,24 @@ def _churn(cat, frm):
     rows = cat.conn.execute(
         # Every row in the window, plus the one immediately before it per slug
         # -- the first day shown needs a baseline too.
-        "SELECT slug, date, features, bytes, sketch FROM snapshots WHERE date>=? OR "
+        "SELECT slug, date, sha256, features, bytes, sketch FROM snapshots "
+        "WHERE date>=? OR "
         "date=(SELECT MAX(date) FROM snapshots p WHERE p.slug=snapshots.slug "
         "AND p.date<?) ORDER BY slug, date", (frm, frm)
     ).fetchall()
 
-    spikes, prev = {}, {}
+    spikes, unmeasured, prev = {}, set(), {}
     for r in rows:
         p = prev.get(r["slug"])
         prev[r["slug"]] = r
         if p is None or r["date"] < frm:
             continue  # the pre-window baseline is a yardstick, not a finding
-        why = _spike(p, r)
+        why, blind = _spike(p, r)
         if why:
             spikes[(r["slug"], r["date"])] = why
-    return spikes
+        elif blind:
+            unmeasured.add((r["slug"], r["date"]))
+    return spikes, unmeasured
 
 
 def _storage(cat, root, dates):
@@ -277,11 +304,16 @@ def _cell(data, slug, d):
         if why:
             return SPIKED, (f"{slug} {d}: LARGE CHANGE, recorded and readable -- "
                             f"{why}. {_human_bytes(s['bytes'])} ({tier})")
+        # Said on the cell as well as in the section below, because this is
+        # where somebody asks what a green square means.
+        blind = (" -- rewrites unchecked, no sketch on one side"
+                 if (slug, d) in data["unmeasured"] else "")
         if s["unchanged_since"]:
             return UNCHANGED, (f"{slug} {d}: pulled, unchanged since "
-                               f"{s['unchanged_since']} ({s['features']:,} features)")
+                               f"{s['unchanged_since']} ({s['features']:,} features)"
+                               f"{blind}")
         return NEW, (f"{slug} {d}: new data, {s['features']:,} features, "
-                     f"{_human_bytes(s['bytes'])} ({tier})")
+                     f"{_human_bytes(s['bytes'])} ({tier}){blind}")
     detail = data["refused"].get((slug, d))
     if detail is not None:
         return REFUSED, f"{slug} {d}: pull REFUSED, nothing recorded -- {detail[:200]}"
@@ -470,10 +502,31 @@ def _growth(st):
             f"<span>{list(st['added'])[-1]}</span></div></div>")
 
 
+def _unmeasured(data):
+    """How much of the window the rewrite test could not cover.
+
+    Only the third test can go unrun, and only where a snapshot predates
+    sketching, so this shrinks to nothing a couple of pulls after a city joins.
+    While it is not nothing, it has to be said: the other two tests reading
+    quiet is not the same as the day being clean.
+    """
+    n = data["unmeasured"]
+    if not n:
+        return ""
+    cities = len({slug for slug, _ in n})
+    return (f"<p class='sub'>Rewrites unchecked on {len(n)} changed city-day"
+            f"{'s' if len(n) != 1 else ''} "
+            f"({cities} of {len(data['slugs'])} cities): one side of "
+            f"the comparison predates sketching, so those days are unmeasured "
+            f"rather than known quiet. The feature-count and byte tests still "
+            f"covered them. Hover a cell to see which.</p>")
+
+
 def _spikes(data):
     if not data["spikes"]:
         return (f"<p class='sub'>No city's content moved by more than "
-                f"{SPIKE_FEATURES:.0%} in a day over this window.</p>")
+                f"{SPIKE_FEATURES:.0%} in a day over this window.</p>"
+                + _unmeasured(data))
     out = ["<p class='sub'>These days are recorded and readable -- unlike a "
            "refusal, nothing was thrown away, and consumers will pull them "
            "normally. They are listed because the content moved far enough that "
@@ -487,6 +540,7 @@ def _spikes(data):
         out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d)}</td>"
                    f"<td class='err'>{html.escape(why)}</td></tr>")
     out.append("</table>")
+    out.append(_unmeasured(data))
     return "".join(out)
 
 

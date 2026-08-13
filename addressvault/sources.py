@@ -26,7 +26,7 @@ class Source:
     format: str
     license_name: str = ""
     source_crs: str = ""                       # e.g. "EPSG:2952"; reproject to WGS84
-    fields: dict = field(default_factory=dict)  # source property -> canonical name
+    fields: dict = field(default_factory=dict)  # canonical name -> source property
     schedule: str = "daily"
     enabled: bool = True
 

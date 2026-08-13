@@ -256,13 +256,19 @@ def test_recovery_from_an_empty_snapshot_is_a_spike():
     # Empty pulls are refused now, but days recorded before that guard existed
     # are still in the catalog (every city, 2026-06-25/26). Coming back from one
     # is a mass change with no baseline to be a percentage of.
-    empty = {"date": "2026-06-26", "features": 0, "bytes": 0}
-    assert report._spike(empty, {"date": "2026-06-28", "features": 525451,
-                                 "bytes": 589258096}) \
-        .startswith("525,451 features, up from an empty snapshot")
+    # Distinct shas throughout: identical days dedup and short-circuit, and it is
+    # the feature counts these two cases turn on.
+    empty = {"date": "2026-06-26", "sha256": "e0", "features": 0, "bytes": 0,
+             "sketch": None}
+    why, blind = report._spike(empty, {"date": "2026-06-28", "sha256": "a1",
+                                       "features": 525451, "bytes": 589258096,
+                                       "sketch": None})
+    assert why.startswith("525,451 features, up from an empty snapshot")
+    assert not blind  # a call this loud does not need the sketch to be sure
     # ...but a run of empty days is one flat line, not a spike every morning.
-    assert report._spike(empty, {"date": "2026-06-27", "features": 0,
-                                 "bytes": 0}) is None
+    assert report._spike(empty, {"date": "2026-06-27", "sha256": "e1",
+                                 "features": 0, "bytes": 0,
+                                 "sketch": None}) == (None, False)
 
 
 def test_build_writes_large_changes_section(vault, http_dir):
@@ -357,7 +363,8 @@ def test_a_dedup_day_carries_the_sketch_forward(vault, http_dir):
 
 def test_a_day_pulled_before_sketching_is_not_read_as_quiet(vault, http_dir):
     """Sketches only exist going forward. A missing one means "cannot say", and
-    must not be mistaken for "nothing moved"."""
+    must not be mistaken for "nothing moved" -- so the day is reported as
+    unmeasured, on the cell and in the section, rather than passing as clean."""
     from datetime import date
 
     base, d = http_dir
@@ -370,6 +377,29 @@ def test_a_day_pulled_before_sketching_is_not_read_as_quiet(vault, http_dir):
 
     data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
     assert data["spikes"] == {}  # unseeable, not silently declared fine
+    assert data["unmeasured"] == {("t", "2026-01-02")}
+    assert "rewrites unchecked" in report._cell(data, "t", "2026-01-02")[1]
+    assert "Rewrites unchecked on 1 changed city-day (" in report._spikes(data)
+
+
+def test_an_identical_day_is_not_reported_unmeasured(vault, http_dir):
+    """A dedup day reaching back past sketching has no sketch to compare, but it
+    does not need one: the file is byte for byte the one before it. Reporting it
+    unmeasured would bury the days that genuinely were not checked."""
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 400, street="MAIN STREET")
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    vault.pull("t", today="2026-01-02")  # identical -> dedup pointer
+    for day in ("2026-01-01", "2026-01-02"):
+        vault.cat.set_snapshot("t", day, sketch=None)  # as old rows are
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert data["unmeasured"] == set()
+    assert report._cell(data, "t", "2026-01-02")[0] == report.UNCHANGED
+    assert "unchecked" not in report._spikes(data)
 
 
 def test_build_writes_storage_section(vault, http_dir):
