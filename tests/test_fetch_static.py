@@ -3,6 +3,7 @@ whole (~590 MB) fetch."""
 
 import contextlib
 import http.server
+import json
 import socketserver
 import threading
 
@@ -10,6 +11,8 @@ import pytest
 import requests
 
 from addressvault.fetch import static
+from addressvault.fetch.degraded import DegradedPull
+from addressvault.sources import Source
 
 # 1 MB: several 256 KB read chunks, so a drop at the halfway mark leaves real
 # progress on disk (and a wrong resume offset shows up as a corrupt file).
@@ -129,3 +132,42 @@ def test_a_down_link_surfaces_as_link_unavailable_not_a_source_failure(
     with serve(BODY, drops=99) as (url, _state):
         with pytest.raises(net.Offline):
             static._download(url, str(dest))
+
+
+def _dump(n, *, located):
+    """A GeoJSON body of ``n`` features, the first ``located`` of them placed."""
+    feats = [{"type": "Feature", "properties": {"id": i},
+              "geometry": ({"type": "Point", "coordinates": [float(i), 0.0]}
+                           if i < located else None)}
+             for i in range(n)]
+    return json.dumps({"type": "FeatureCollection", "features": feats}).encode()
+
+
+def _static_src(url):
+    return Source(slug="t", provider="T", data_url=url,
+                  access="static", format="geojson")
+
+
+def test_scan_features_counts_rows_and_unlocated_rows_in_one_pass(tmp_path):
+    path = tmp_path / "d.geojson"
+    path.write_bytes(_dump(10, located=7))
+    assert static._scan_features(str(path)) == (10, 3)
+
+
+def test_a_dump_with_no_coordinates_is_refused(tmp_path):
+    # The static path never looked inside the file beyond counting rows, so a
+    # dump republished with its geometry stripped landed as a clean day.
+    with serve(_dump(20, located=0), drops=0) as (url, _state):
+        with pytest.raises(DegradedPull,
+                           match=r"geometry-less pull: 20 of 20 features"):
+            static.fetch(_static_src(url), str(tmp_path), today="2026-01-01")
+    # This path moves the file into place before it can look inside, so the
+    # refusal has to take it back out -- the Vault records no snapshot for one,
+    # and a file no catalog row points at is drift the report has to explain.
+    assert not (tmp_path / "t-2026-01-01.geojson").exists()
+
+
+def test_a_dump_with_a_few_unlocated_rows_is_kept(tmp_path):
+    with serve(_dump(1000, located=995), drops=0) as (url, _state):
+        _, count, _ = static.fetch(_static_src(url), str(tmp_path), today="2026-01-01")
+    assert count == 1000  # 5/1000 == 0.5%, inside the 1% tolerance

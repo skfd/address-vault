@@ -100,6 +100,7 @@ addressvault thaw <slug> <date> [--ttl-hours N]
 addressvault sweep [--keep-days N]        # cool aged hot copies; drop expired thaws
 addressvault stats [--json]
 addressvault report [--out PATH] [--days N]            # self-contained HTML status page
+addressvault backfill [slug ...]          # reduce on-disk days the fingerprint columns predate
 ```
 
 `report` renders one static HTML file from the catalog — a city × day matrix
@@ -108,19 +109,37 @@ and growth per tier including catalog-vs-disk drift, the **Large changes** list,
 and the failure log. It defaults to `<vault>/report.html`; open it in a browser,
 no server involved.
 
-**Large changes** is the operator's cue to look at a city. A day lands there when,
-against the previous snapshot, any of three things moved ≥2%:
+**Large changes** is the operator's cue to look at a city. A day lands there when
+something moved against the previous snapshot, by whichever of these tests sees
+it first — they are ordered so that the most explanatory answer wins:
 
-| test | catches | needs |
-| --- | --- | --- |
-| feature count | a city gaining or losing addresses wholesale | nothing — retroactive over all history |
-| bytes vs. features | rows rewritten in place, which a count-only check cannot see | nothing — retroactive |
-| addresses rewritten | a rewrite that holds size *and* count steady | a stored sketch, so forward-only |
+| test | catches | threshold | needs |
+| --- | --- | --- | --- |
+| feature count | a city gaining or losing addresses wholesale | 2% | nothing — retroactive over all history |
+| duplicate rows | a source replaying part of its own load | 0.5% move | a stored count, so forward-only |
+| published fields | a schema change — named, not mistaken for a rewrite | any change | a stored field list, so forward-only |
+| bytes vs. features | rows rewritten in place, which a count-only check cannot see | 2% | nothing — retroactive |
+| addresses rewritten | a rewrite that holds size *and* count steady | 2% | a stored sketch, so forward-only |
 
-The thresholds sit in a wide empty band: across the vault's own history the
-largest *legitimate* day-over-day feature change was 0.63%.
+Every threshold sits in a wide empty band measured from the vault's own history:
+the largest *legitimate* day-over-day feature change was 0.63%, and the largest
+legitimate move in the duplicate-row share was 0.0218%.
 
-The third test exists because the first two are scalars, and a source can rename
+Two of these exist because of what the other three could not see. **Duplicate
+rows** are invisible to all of them — the sketch below fingerprints the *set* of
+addresses, so when brant's nightly rebuild replayed a 1,000-row batch on
+2026-08-16 it read 0.0000% churn in both directions, and only the feature count
+caught it, and only because 1,000 rows happened to clear 2%. It is compared as a
+*move* rather than a level because the level belongs to the source and nothing
+else: windsor publishes 14.17% duplicate rows every day, waterloo 0.005%.
+
+**Published fields** is checked before the byte test because a field added to
+every row explains a size move that would otherwise be reported as a rewrite:
+guelph added one field on 2026-07-24 and was described as 53,796 rows rewritten
+in place, which was true of none of them. Naming the field says everything the
+percentage did not.
+
+The last test exists because the scalar ones are scalars, and a source can rename
 every street to an equal-length name, or re-geocode every point, without moving
 either number. Each pull reduces its snapshot to an 8 KB **bottom-k sketch** —
 the 1,024 smallest hashes of its addresses — so the report compares 8 KB against
@@ -134,8 +153,11 @@ churning metadata — brant regenerates every `GLOBALID` and shifts every
 `CREATED_DATE` daily without moving a single address — so hashing whole features
 would report 100% churn every morning and be worthless.
 
-A snapshot pulled before sketching existed stores no sketch, and a day the vault
-cannot measure is reported as unmeasured rather than as quiet.
+A snapshot pulled before these columns existed carries none of them, and a day
+the vault cannot measure is reported as unmeasured rather than as quiet.
+`addressvault backfill` recovers them for any day whose file is still hot; a day
+already swept to cold stays unmeasured, since thawing the archive to answer a
+report is not a trade worth making.
 
 This is a flag, not a gate. Unlike a refused pull (which records nothing, because
 the data provably is not what the source holds), a flagged day **is** what the
@@ -144,6 +166,30 @@ the question because it is the only place that can ask it cheaply; it must not
 answer it by discarding the day, since a genuine 30% change is exactly what an
 archive exists to keep. Deciding whether consumers need reimporting is the
 operator's call.
+
+## What a pull refuses
+
+Two things can go wrong without anything failing: the transport works, the
+response parses, and what came back still is not the layer. Those end the pull
+as **refused** — recorded apart from `failed` all the way to the report, because
+a human has to decide which it is, and nothing in here can.
+
+| guard | catches | tolerance |
+| --- | --- | --- |
+| against the layer's own count, short | a pull that stopped early — a blank page mid-stream ends the paging loop, and 102,000 of kitchener's 131,912 addresses read as the whole city | 1% short, since the layer keeps being edited while we page it |
+| against the layer's own count, long | rows served twice — paging assumes the OID window holds still across queries, and brant serves a view that renumbers `OBJECTID` 1..N on every pull | 2% over, wider because rows added after the count probe land on this side |
+| against rows with no position | a point layer that arrived without its points — muskoka 2026-06-30 served all 66,512 rows with a null geometry | 1% unlocated, since a city can record an address before anybody pins it |
+
+The geometry guard exists because nothing else sees that failure: the rows are
+all there, the fields are all there, and the byte count is plausible. That day
+was only ever caught after the fact, by an incidental 14.4% drop in file size,
+and a source that dropped geometry without shrinking would not even leave that
+trace. Both guards sit in wide empty bands — across the snapshots on disk (11.5M
+features, every source represented) the most any legitimate pull missed was
+0.0026%, one row of huron's 38,315, against a failure at 100%.
+
+A refusal records nothing, deliberately: the data provably is not what the
+source holds, so the source stays due and the next run retries it.
 
 ## Scheduling
 

@@ -157,6 +157,11 @@ def cmd_stats(vault, args):
           f"hot={st['hot']} cold={st['cold']} hot_bytes={st['hot_bytes']:,}")
 
 
+def cmd_backfill(vault, args):
+    filled = vault.backfill(slugs=args.slug or None)
+    print(f"  filled {len(filled)} snapshot(s)")
+
+
 def cmd_report(vault, args):
     from addressvault import report
     path = report.build(vault, days=args.days, out=args.out)
@@ -195,6 +200,8 @@ def main(argv=None):
 
     sp = sub.add_parser("sweep"); sp.add_argument("--keep-days", type=int, default=2)
     sp = sub.add_parser("stats"); sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("backfill", help="reduce on-disk days the fingerprint columns predate")
+    sp.add_argument("slug", nargs="*", help="limit to these slugs (default: all)")
     sp = sub.add_parser("report")
     sp.add_argument("--out", help="output path (default: <vault>/report.html)")
     sp.add_argument("--days", type=int, default=42)
@@ -210,6 +217,7 @@ def main(argv=None):
         "pull-due": cmd_pull_due, "serve": cmd_serve, "snapshots": cmd_snapshots,
         "data": cmd_data, "status": cmd_status, "thaw": cmd_thaw,
         "sweep": cmd_sweep, "stats": cmd_stats, "report": cmd_report,
+        "backfill": cmd_backfill,
     }
     handlers[args.command](vault, args)
 

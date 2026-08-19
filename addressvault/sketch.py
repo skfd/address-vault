@@ -21,11 +21,18 @@ features reports 100% churn every morning and is worthless. Each source already
 declares which properties carry the address (``Source.fields``, shared with
 ``ontario-address-changes``); those, plus the rounded coordinate, are the
 identity. Everything else is publishing noise and is deliberately excluded.
+
+The same pass yields two things the sketch is structurally blind to, because
+reading the file is the expensive part and it is already being read: the count
+of *distinct* addresses (the sketch collapses duplicates, so it cannot report
+them) and the set of property names the source published (which is what tells a
+schema change apart from a change to the data). See ``Reduction``.
 """
 
 import hashlib
 import heapq
 import json
+from typing import NamedTuple
 
 import ijson
 
@@ -67,26 +74,49 @@ def _h64(s):
         hashlib.blake2b(s.encode(), digest_size=_HASH_BYTES).digest(), "big")
 
 
-def of_file(path, fields, k=K):
-    """Stream a snapshot and return its sketch: the k smallest address hashes.
+class Reduction(NamedTuple):
+    """Everything one pass over a snapshot yields, since the pass is the cost.
 
-    Streamed, so peak memory is the sketch itself rather than the file. Duplicate
-    addresses collapse -- the sketch is of the *set* of addresses, which is what
-    makes it comparable across days when the row order changes.
+    ``sketch`` measures rewrites; ``rows`` against ``distinct`` measures
+    duplication, which the sketch cannot see at all because it is a fingerprint
+    of the *set* (brant 2026-08-16 arrived with 1,000 rows duplicated and read
+    0.0000% churn in both directions); ``field_names`` is what the source
+    published, which is what tells a schema change apart from a data change.
     """
-    heap, held = [], set()  # max-heap of negated hashes; `held` mirrors it
+    sketch: list
+    rows: int
+    distinct: int
+    field_names: tuple
+
+
+def reduce_file(path, fields, k=K):
+    """Stream a snapshot once and reduce it to everything the report needs.
+
+    Peak memory is one 64-bit hash per distinct address -- about 50 MB for the
+    largest city here, against a pull that just held the whole parsed layer.
+    That is the price of an exact ``distinct``: the bottom-k sample cannot give
+    one, since a duplicate outside the k smallest hashes is invisible to it.
+    """
+    heap = []  # max-heap of negated hashes: the k smallest seen so far
+    seen, names, rows = set(), set(), 0
     with open(path, "rb") as f:
         for feat in ijson.items(f, "features.item"):
+            rows += 1
+            names |= (feat.get("properties") or {}).keys()
             h = _h64(project(feat, fields))
-            if h in held:
-                continue
+            if h in seen:
+                continue  # same address again: the sketch is of the set
+            seen.add(h)
             if len(heap) < k:
                 heapq.heappush(heap, -h)
-                held.add(h)
             elif h < -heap[0]:
-                held.discard(-heapq.heappushpop(heap, -h))
-                held.add(h)
-    return sorted(-x for x in heap)
+                heapq.heappushpop(heap, -h)
+    return Reduction(sorted(-x for x in heap), rows, len(seen), tuple(sorted(names)))
+
+
+def of_file(path, fields, k=K):
+    """Just the sketch: the k smallest address hashes. See ``reduce_file``."""
+    return reduce_file(path, fields, k).sketch
 
 
 def encode(sk):

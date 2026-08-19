@@ -168,3 +168,56 @@ def test_a_down_link_surfaces_as_link_unavailable_without_burning_retries(
     with pytest.raises(net.Offline):
         arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert len(calls) == 1  # no retries against a link that cannot work
+
+
+def test_a_layer_that_lost_its_geometry_is_refused(tmp_path, monkeypatch):
+    # muskoka 2026-06-30: the count matched, every field arrived, and all 66,512
+    # rows came back with a null geometry. Every check we had passed it.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
+    flat = {"features": [{"type": "Feature", "properties": {"OBJECTID": o},
+                          "geometry": None} for o in (1, 2)]}
+    pages = iter([flat, _page()])
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    with pytest.raises(arcgis.DegradedPull,
+                       match=r"geometry-less pull: 2 of 2 features"):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert list(tmp_path.iterdir()) == []  # nothing written over a located city
+
+
+def test_a_few_unlocated_addresses_are_not_a_refusal(tmp_path, monkeypatch):
+    # A city can record an address before anybody has put a pin in it; huron
+    # carries one such row in 38,315. That is the layer, not a broken pull.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: dict(META, maxRecordCount=500))
+    good = _page(*range(1, 200))["features"]
+    good[0]["geometry"] = None
+    pages = iter([{"features": good}, _page()])
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 199)
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 199  # 1/199 == 0.5%, inside the 1% tolerance
+
+
+def test_a_pull_that_overshoots_the_layer_count_is_refused(tmp_path, monkeypatch):
+    # Paging assumes the OID window is stable across queries; a layer that
+    # renumbers underneath us would re-serve rows we already hold. Every row is
+    # real and located, so only the count says anything.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: dict(META, maxRecordCount=500))
+    pages = iter([_page(*range(1, 301)), _page()])
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 200)
+    with pytest.raises(arcgis.DegradedPull,
+                       match=r"overlong pull: 300 features, layer reports 200"):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_rows_added_while_paging_stay_inside_the_overcount_tolerance(tmp_path, monkeypatch):
+    # The count is probed before paging starts, so a live layer can gain a few
+    # rows ahead of us. That is the asymmetry the wider tolerance exists for.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: dict(META, maxRecordCount=500))
+    pages = iter([_page(*range(1, 303)), _page()])
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 300)  # 2% of 300 == 6
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 302

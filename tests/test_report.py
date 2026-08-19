@@ -201,7 +201,15 @@ def test_rows_rewritten_in_place_are_flagged(vault, http_dir):
     from datetime import date
 
     base, d = http_dir
-    write_geojson(d, "addr.geojson", 200)
+    # Day one already carries the fields day two rewrites, so what moves is the
+    # values and only the values -- a source that *added* a field would be a
+    # schema change, which is a different finding and is tested separately.
+    (d / "addr.geojson").write_text(json.dumps({
+        "type": "FeatureCollection", "features": [
+            {"type": "Feature",
+             "properties": {"id": i, "street": "AVENUE", "unit": "1"},
+             "geometry": {"type": "Point", "coordinates": [float(i), 0.0]}}
+            for i in range(200)]}))
     _add(vault, base)
     vault.pull("t", today="2026-01-01")
     # The same 200 addresses, every one of them re-tagged. The feature count
@@ -414,3 +422,85 @@ def test_build_writes_storage_section(vault, http_dir):
     assert "<h2>Storage</h2>" in page
     assert "New bytes per day" in page
     assert "Catalog vs disk" in page
+
+
+def _fc(feats):
+    return json.dumps({"type": "FeatureCollection", "features": feats})
+
+
+def _rows(n, *, street="AVENUE", extra=None):
+    return [{"type": "Feature",
+             "properties": {"id": i, "street": street, **(extra or {})},
+             "geometry": {"type": "Point", "coordinates": [float(i), 0.0]}}
+            for i in range(n)]
+
+
+def test_a_replayed_batch_of_duplicate_rows_is_flagged(vault, http_dir):
+    # brant 2026-08-16: the source's nightly rebuild wrote one 1,000-row batch
+    # twice. The addresses were all already there, so the sketch read 0.0000%
+    # churn; only the count of rows that repeat an address moved.
+    from datetime import date
+
+    base, d = http_dir
+    (d / "addr.geojson").write_text(_fc(_rows(400)))
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    # 400 rows again, but 20 of them are a second copy of rows 0-19.
+    (d / "addr.geojson").write_text(_fc(_rows(380) + _rows(20)))
+    vault.pull("t", today="2026-01-02")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    why = data["spikes"][("t", "2026-01-02")]
+    assert "duplicate rows" in why and "0 -> 20" in why
+    assert report._cell(data, "t", "2026-01-02")[0] == report.SPIKED
+
+
+def test_a_source_that_always_duplicates_is_not_flagged_every_day(vault, http_dir):
+    # windsor publishes 14% duplicate rows every single day. The level is the
+    # source's business; only a move in it is the report's.
+    from datetime import date
+
+    base, d = http_dir
+    (d / "addr.geojson").write_text(_fc(_rows(380) + _rows(20)))
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    (d / "addr.geojson").write_text(_fc(_rows(380, street="AVE") + _rows(20, street="AVE")))
+    vault.pull("t", today="2026-01-02")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert "duplicate rows" not in (data["spikes"].get(("t", "2026-01-02")) or "")
+
+
+def test_a_field_appearing_is_named_not_called_a_rewrite(vault, http_dir):
+    # guelph 2026-07-24 added STATION_RESPONSE_ORDER to all 53,796 rows and was
+    # reported as 53,796 rows "rewritten in place" -- true of none of them.
+    from datetime import date
+
+    base, d = http_dir
+    (d / "addr.geojson").write_text(_fc(_rows(300)))
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    (d / "addr.geojson").write_text(
+        _fc(_rows(300, extra={"STATION_RESPONSE_ORDER": "1-4-5-2-3-6"})))
+    vault.pull("t", today="2026-01-02")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    why = data["spikes"][("t", "2026-01-02")]
+    assert why.startswith("published fields changed: +STATION_RESPONSE_ORDER")
+    assert "rewritten in place" not in why  # the size move is explained, not restated
+
+
+def test_a_field_disappearing_is_named_too(vault, http_dir):
+    # guelph 2026-08-04, the same event the other way round: AMAID was dropped.
+    from datetime import date
+
+    base, d = http_dir
+    (d / "addr.geojson").write_text(_fc(_rows(300, extra={"AMAID": "0000000000"})))
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    (d / "addr.geojson").write_text(_fc(_rows(300)))
+    vault.pull("t", today="2026-01-02")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert data["spikes"][("t", "2026-01-02")].startswith(
+        "published fields changed: -AMAID")

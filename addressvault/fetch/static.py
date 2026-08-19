@@ -18,6 +18,8 @@ import ijson
 import requests
 
 from addressvault import net
+from addressvault.fetch.degraded import (
+    DegradedPull, check_geometry, has_coords)
 
 TIMEOUT = 300
 # A connection dropped mid-body used to cost the whole day's fetch (observed
@@ -99,10 +101,18 @@ def _unzip(path, dest_dir):
         z.extractall(dest_dir)
 
 
-def _count_features(path):
-    """Stream-count Features without loading the file into memory."""
+def _scan_features(path):
+    """``(count, missing)``: Features, and how many carry no coordinates.
+
+    One streaming pass for both, without loading the file into memory. The
+    geometry tally rides along on the count rather than costing a second read --
+    ijson has already built each feature by the time we tick the counter."""
+    counted = missing = 0
     with open(path, "rb") as f:
-        return sum(1 for _ in ijson.items(f, "features.item"))
+        for feat in ijson.items(f, "features.item"):
+            counted += 1
+            missing += not has_coords(feat)
+    return counted, missing
 
 
 def _read_shapefile(shp_path, source_crs=""):
@@ -159,7 +169,9 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
         if (remote and remote.get("last_modified") == prev.get("last_modified")
                 and remote.get("content_length") == prev.get("content_length")):
             print(f"  reusing {os.path.basename(prev['path'])} (remote unchanged)")
-            return prev["path"], _count_features(prev["path"]), remote
+            count, missing = _scan_features(prev["path"])
+            check_geometry(missing, count)
+            return prev["path"], count, remote
 
     work = os.path.join(dest_dir, "_download")
     os.makedirs(work, exist_ok=True)
@@ -180,6 +192,7 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
             json.dump({"type": "FeatureCollection", "features": features}, f)
         os.replace(tmp, filepath)  # atomic
         count = len(features)
+        missing = sum(1 for f in features if not has_coords(f))
     else:  # geojson -- already WGS84; move it into place without parsing whole
         if is_zip:
             try:
@@ -189,7 +202,20 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
         else:
             src = raw
         os.replace(src, filepath)
-        count = _count_features(filepath)
+        count, missing = _scan_features(filepath)
+
+    # A dump can arrive whole, and be an address layer with no addresses in
+    # it -- every row, every field, no position. See fetch.degraded. Unlike the
+    # arcgis path, this one has already moved the file into place by now (it
+    # streams rather than holding the features in memory), so a refusal has to
+    # take it back out: the Vault records no snapshot for a refused pull, and a
+    # file no catalog row points at is exactly the drift `report` counts as
+    # "other" bytes.
+    try:
+        check_geometry(missing, count)
+    except DegradedPull:
+        os.remove(filepath)
+        raise
 
     print(f"  parsed {count:,} features")
     return filepath, count, headers

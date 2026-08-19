@@ -85,3 +85,32 @@ def test_snapshot_by_sha_returns_earliest(tmp_path):
     cat.upsert_snapshot(slug="t", date="2026-01-05", sha256="dup", **base)
     cat.upsert_snapshot(slug="t", date="2026-01-02", sha256="dup", **base)
     assert cat.snapshot_by_sha("t", "dup", exclude_date="2026-01-09")["date"] == "2026-01-02"
+
+
+def test_backfill_reduces_on_disk_days_and_dedup_days_inherit(vault, http_dir):
+    from conftest import write_geojson
+    from addressvault.sources import Source
+
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 50)
+    vault.add_source(Source(slug="t", provider="T", data_url=f"{base}/addr.geojson",
+                            access="static", format="geojson"))
+    vault.pull("t", today="2026-01-01")
+    vault.pull("t", today="2026-01-02")  # same bytes -> a dedup day
+
+    # Blank the columns to stand in for days pulled before they existed.
+    vault.cat.conn.execute("UPDATE snapshots SET sketch=NULL, "
+                           "distinct_addresses=NULL, field_names=NULL")
+    vault.cat.conn.commit()
+
+    filled = vault.backfill()
+    assert ("t", "2026-01-01") in filled  # the canonical day was re-read
+    assert ("t", "2026-01-02") in filled  # the dedup day inherited it
+
+    canon = vault.cat.get_snapshot("t", "2026-01-01")
+    dedup = vault.cat.get_snapshot("t", "2026-01-02")
+    assert canon["distinct_addresses"] == 50
+    assert canon["field_names"] == "id"
+    for col in ("sketch", "distinct_addresses", "field_names"):
+        assert dedup[col] == canon[col], col
+    assert vault.backfill() == []  # nothing left to do; safe to re-run

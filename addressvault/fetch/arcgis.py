@@ -13,6 +13,8 @@ from datetime import date as _date
 import requests
 
 from addressvault import net
+from addressvault.fetch.degraded import (  # noqa: F401  (DegradedPull re-exported)
+    DegradedPull, check_geometry, has_coords)
 
 TIMEOUT = 120
 DEFAULT_PAGE = 2000
@@ -26,14 +28,17 @@ RETRY_WAIT = 900
 # truncated. Not zero: the layer keeps being edited while we page it, so a few
 # rows can legitimately disappear between the count probe and the last page.
 COUNT_TOLERANCE = 0.01
-
-
-class DegradedPull(ValueError):
-    """The pull arrived, and is not trustworthy: the transport worked but what
-    came back does not describe the layer. Kept apart from an ordinary fetch
-    error because the two want different responses -- a timeout resolves itself
-    on the next run, while this one is either a source that has started serving
-    damaged data or a real change big enough that somebody should look."""
+# And how far above. Wider than the short side, because the two sides are not
+# symmetric: rows added after the count probe legitimately land on this one,
+# while the OID window already skips any that land behind us.
+#
+# Worth checking at all because paging assumes the OID window is stable across
+# queries, and for some layers it demonstrably is not -- brant serves a view
+# that renumbers OBJECTID 1..N on every pull. Within one pull the order has
+# held, but nothing here verifies that, and a window that shifted underneath us
+# would re-serve rows we already hold. That is invisible to every other check:
+# the rows are real, the geometry is real, only there are too many of them.
+OVERCOUNT_TOLERANCE = 0.02
 
 
 def _json(r):
@@ -180,6 +185,14 @@ def fetch(source, dest_dir, *, force=False, today=None):
     if expected is not None and len(features) < expected * (1 - COUNT_TOLERANCE):
         raise DegradedPull(f"truncated pull: {len(features):,} features, "
                            f"layer reports {expected:,}")
+    if expected is not None and len(features) > expected * (1 + OVERCOUNT_TOLERANCE):
+        raise DegradedPull(f"overlong pull: {len(features):,} features, "
+                           f"layer reports {expected:,}")
+
+    # Every row can arrive, and be the wrong rows: the count check above passes
+    # a response whose geometry the server dropped on the way out (muskoka
+    # 2026-06-30, 66,512 rows and not one coordinate).
+    check_geometry(sum(1 for f in features if not has_coords(f)), len(features))
 
     tmp = filepath + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

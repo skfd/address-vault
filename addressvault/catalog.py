@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS snapshots(
   src_last_modified TEXT, src_content_length INTEGER,
   on_disk INTEGER, archived INTEGER, restored_until TEXT,
   unchanged_since TEXT, fetched_at TEXT, sketch BLOB,
+  distinct_addresses INTEGER, field_names TEXT,
   PRIMARY KEY(slug, date)
 );
 CREATE TABLE IF NOT EXISTS jobs(
@@ -57,13 +58,15 @@ _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",
     "src_last_modified", "src_content_length",
     "on_disk", "archived", "restored_until", "unchanged_since", "fetched_at",
-    "sketch",
+    "sketch", "distinct_addresses", "field_names",
 )
 
 # Columns added to `snapshots` after the first vaults were built. SCHEMA above
 # creates them for a new vault; an existing one gets them here. Both paths must
 # agree, so a column added there needs a line here too.
-_ADDED_COLS = (("sketch", "BLOB"),)
+_ADDED_COLS = (("sketch", "BLOB"),
+               ("distinct_addresses", "INTEGER"),
+               ("field_names", "TEXT"))
 
 
 def _now():
@@ -179,6 +182,48 @@ class Catalog:
             "ORDER BY slug, date",
             (cutoff_date,),
         ).fetchall()
+
+    # `sketch`, `distinct_addresses` and `field_names` all come from one pass
+    # over a snapshot's file, so they go missing and get filled together.
+    _MISSING_FINGERPRINT = (
+        "sketch IS NULL OR distinct_addresses IS NULL OR field_names IS NULL")
+
+    def needing_fingerprints(self, slugs=None):
+        """On-disk canonical snapshots missing any fingerprint column.
+
+        Canonical only: a dedup day stores no file of its own, and takes its
+        fingerprints from the day it points at (see ``inherit_fingerprints``)."""
+        q = ("SELECT * FROM snapshots WHERE on_disk=1 AND unchanged_since IS NULL "
+             f"AND ({self._MISSING_FINGERPRINT})")
+        args = []
+        if slugs:
+            q += f" AND slug IN ({','.join('?' * len(slugs))})"
+            args = list(slugs)
+        return self.conn.execute(q + " ORDER BY slug, date", args).fetchall()
+
+    def inherit_fingerprints(self):
+        """Hand each dedup day the fingerprints of the day it points at.
+
+        The content is byte-identical, so the fingerprints are too. This is the
+        same inheritance a dedup pull does, applied to rows recorded before
+        their canonical day had anything to lend -- which is why it runs after
+        the reducing pass, not before. Returns the pairs it filled."""
+        rows = self.conn.execute(
+            "SELECT d.slug, d.date, c.sketch, c.distinct_addresses, c.field_names "
+            "FROM snapshots d "
+            "JOIN snapshots c ON c.slug=d.slug AND c.date=d.unchanged_since "
+            "WHERE (d.sketch IS NULL OR d.distinct_addresses IS NULL "
+            "       OR d.field_names IS NULL) "
+            "  AND c.sketch IS NOT NULL AND c.distinct_addresses IS NOT NULL "
+            "  AND c.field_names IS NOT NULL"
+        ).fetchall()
+        self.conn.executemany(
+            "UPDATE snapshots SET sketch=?, distinct_addresses=?, field_names=? "
+            "WHERE slug=? AND date=?",
+            [(r["sketch"], r["distinct_addresses"], r["field_names"],
+              r["slug"], r["date"]) for r in rows])
+        self.conn.commit()
+        return [(r["slug"], r["date"]) for r in rows]
 
     def due_for_recool(self, now_iso):
         """Thawed copies whose TTL has elapsed."""

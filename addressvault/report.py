@@ -45,6 +45,19 @@ SPIKE_DIVERGENCE = 0.02
 # one line; the sketch reads a true 2% as ~1.7%, so this fires a shade late
 # rather than early, which is the right way round for a flag nobody can dismiss.
 SPIKE_CHURN = 0.02
+# How far the share of rows that are duplicates of another row may move in a day.
+# Duplication is invisible to all three tests above: the sketch fingerprints the
+# *set* of addresses, so it read brant 2026-08-16 -- 1,000 rows replayed by the
+# source's nightly rebuild -- as 0.0000% churn in both directions, and only the
+# feature count caught it, and only because 1,000 rows happened to clear 2%.
+#
+# Compared as a move rather than a level, because the level is a property of the
+# source and nothing else: windsor publishes 14.17% duplicate rows every day,
+# waterloo 0.005%. The move is what is stable -- across the snapshots on disk the
+# largest legitimate day-over-day change was 0.0218% (kingston), against 4.92%
+# for the brant event, so the line sits in a wide empty band an order of
+# magnitude either side.
+SPIKE_DUPLICATES = 0.005
 
 
 def build(vault, days=42, out=None, today=None):
@@ -126,14 +139,20 @@ def _spike(p, r):
     "nothing we could see moved" -- reported separately rather than counted as
     a clean day.
 
-    Three shapes of one question. The feature count moving is a city gaining or
-    losing addresses wholesale. The byte count moving while the feature count
-    holds still is a source rewriting rows in place; it is measured as the gap
-    between the two, so ordinary growth -- where bytes and rows move together --
-    says nothing. Both are scalars, and a rewrite that holds size as well as
-    count slips past them: the sketch comparison is what sees that one, and it
-    is checked last because it is the only test that needs a stored fingerprint
-    and so is blind to days pulled before sketching existed.
+    Shapes of one question, cheapest and most explanatory first. The feature
+    count moving is a city gaining or losing addresses wholesale. Rows that are
+    duplicates of another row appearing en masse is a source replaying part of
+    its own load. A change to the published field list explains a size move that
+    would otherwise read as a rewrite, and is checked before the byte test for
+    exactly that reason -- guelph 2026-07-24 added one field to every row and
+    was reported as 53,796 rows rewritten in place, which was not true of a
+    single one of them. The byte count moving while the feature count holds
+    still is what remains after that: a source rewriting rows in place, measured
+    as the gap between the two, so ordinary growth -- where bytes and rows move
+    together -- says nothing. All of those are scalars, and a rewrite that holds
+    size as well as count slips past every one: the sketch comparison sees that
+    case, and is checked last because it is the only test needing a stored
+    fingerprint and so is blind to days pulled before sketching existed.
     """
     if p["sha256"] and r["sha256"] == p["sha256"]:
         # Byte-identical to the day before: nothing moved, and no fingerprint is
@@ -151,6 +170,27 @@ def _spike(p, r):
     if abs(df) >= SPIKE_FEATURES:
         return (f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
                 f"(since {p['date']})"), False
+    if p["distinct_addresses"] and r["distinct_addresses"]:
+        # Duplicate rows: rows the source published twice. A level here is
+        # normal and source-specific; a *move* is the source replaying a batch.
+        dup_p = (p["features"] - p["distinct_addresses"]) / p["features"]
+        dup_r = (r["features"] - r["distinct_addresses"]) / r["features"]
+        if abs(dup_r - dup_p) >= SPIKE_DUPLICATES:
+            return (f"{dup_r - dup_p:+.1%} duplicate rows: "
+                    f"{p['features'] - p['distinct_addresses']:,} -> "
+                    f"{r['features'] - r['distinct_addresses']:,} rows repeat an "
+                    f"address already in the file (since {p['date']})"), False
+    if p["field_names"] and r["field_names"]:
+        # A schema change, not a data change. Named rather than measured: the
+        # size move it causes says nothing a consumer can act on, and the field
+        # names say everything.
+        was = set(p["field_names"].split("\n"))
+        now = set(r["field_names"].split("\n"))
+        if was != now:
+            moved = [f"+{f}" for f in sorted(now - was)]
+            moved += [f"-{f}" for f in sorted(was - now)]
+            return (f"published fields changed: {', '.join(moved)} "
+                    f"(since {p['date']})"), False
     if p["bytes"]:
         db = (r["bytes"] - p["bytes"]) / p["bytes"]
         if abs(db - df) >= SPIKE_DIVERGENCE:
@@ -193,7 +233,8 @@ def _churn(cat, frm):
     rows = cat.conn.execute(
         # Every row in the window, plus the one immediately before it per slug
         # -- the first day shown needs a baseline too.
-        "SELECT slug, date, sha256, features, bytes, sketch FROM snapshots "
+        "SELECT slug, date, sha256, features, bytes, sketch, "
+        "distinct_addresses, field_names FROM snapshots "
         "WHERE date>=? OR "
         "date=(SELECT MAX(date) FROM snapshots p WHERE p.slug=snapshots.slug "
         "AND p.date<?) ORDER BY slug, date", (frm, frm)

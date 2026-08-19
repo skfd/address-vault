@@ -117,9 +117,15 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def _sketch(path, fields):
-    """The snapshot's address fingerprint, ready to store (see ``sketch``)."""
-    return sketch_mod.encode(sketch_mod.of_file(path, fields))
+def _reduce(path, fields):
+    """The snapshot's fingerprints, ready to store (see ``sketch``).
+
+    One pass, three columns: the address sketch, the distinct-address count the
+    sketch collapses away, and the property names the source published."""
+    r = sketch_mod.reduce_file(path, fields)
+    return {"sketch": sketch_mod.encode(r.sketch),
+            "distinct_addresses": r.distinct,
+            "field_names": "\n".join(r.field_names)}
 
 
 def _src_from_row(row):
@@ -301,10 +307,12 @@ class Vault:
                 src_content_length=headers.get("content_length"),
                 on_disk=0, archived=0, restored_until=None,
                 unchanged_since=canon, fetched_at=_now(),
-                # Identical content: the canonical day's sketch is this day's
-                # too, and carrying it forward keeps consecutive rows
+                # Identical content: the canonical day's fingerprints are this
+                # day's too, and carrying them forward keeps consecutive rows
                 # comparable without re-reading a file we did not rewrite.
                 sketch=prior["sketch"],
+                distinct_addresses=prior["distinct_addresses"],
+                field_names=prior["field_names"],
             )
         else:
             if path != today_path:  # static reused an existing file; materialise today's
@@ -316,7 +324,7 @@ class Vault:
                 src_content_length=headers.get("content_length"),
                 on_disk=1, archived=0, restored_until=None,
                 unchanged_since=None, fetched_at=_now(),
-                sketch=_sketch(today_path, src.fields),
+                **_reduce(today_path, src.fields),
             )
         self.cat.record_job("pull", slug, day, "done")
         self.cat.set_lease_state(slug, "done")
@@ -395,6 +403,39 @@ class Vault:
             finally:
                 self.cat.set_lease_state(slug, "done")
         return swept
+
+    def backfill(self, slugs=None):
+        """Fill the fingerprint columns for days whose file is still on disk.
+
+        The three columns ``_reduce`` writes are forward-only by nature: a day
+        already swept to cold cannot be reduced without thawing it, and thawing
+        the archive to answer a report is not a trade worth making. What is
+        recoverable cheaply is every day still hot, which is what this does --
+        it turns "never measured" into a real answer for those, and leaves the
+        rest honestly unmeasured.
+
+        Dedup days inherit from their canonical day, exactly as at pull time, so
+        a swept canonical day still lends its fingerprints to the hot days that
+        point at it. Returns the (slug, date) pairs it filled.
+        """
+        filled = []
+        for row in self.cat.needing_fingerprints(slugs):
+            slug, d = row["slug"], row["date"]
+            path = config.snapshot_path(self.root, slug, d)
+            if not os.path.isfile(path):
+                continue  # swept out from under us since the query
+            if not self.cat.acquire_lease(slug, "backfill", d, _holder(),
+                                          self.lease_ttl, "reducing"):
+                print(f"  {slug} is being written, skipping")
+                continue
+            try:
+                print(f"  reducing {slug} {d}")
+                self.cat.set_snapshot(slug, d, **_reduce(path, self.source(slug).fields))
+                filled.append((slug, d))
+            finally:
+                self.cat.set_lease_state(slug, "done")
+        filled += self.cat.inherit_fingerprints()
+        return filled
 
     def recool_expired(self, now=None):
         now_iso = now or _now()

@@ -8,7 +8,7 @@ re-download when the remote is unchanged.
 """
 
 from . import arcgis, static
-from .arcgis import DegradedPull  # noqa: F401  (re-exported: raised here, handled by Vault)
+from .degraded import DegradedPull  # noqa: F401  (re-exported: raised below, handled by Vault)
 
 
 def fetch(source, dest_dir, *, prev=None, force=False, today=None):
