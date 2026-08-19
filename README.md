@@ -99,7 +99,8 @@ addressvault status <slug> [--json]       # progress of an in-flight (or the las
 addressvault thaw <slug> <date> [--ttl-hours N]
 addressvault sweep [--keep-days N]        # cool aged hot copies; drop expired thaws
 addressvault stats [--json]
-addressvault report [--out PATH] [--days N]            # self-contained HTML status page
+addressvault report [--out PATH] [--days N] [--json]   # HTML status page, or the same as data
+addressvault review <slug> <date> <verdict> -m NOTE    # answer a flagged large change
 addressvault backfill [slug ...]          # reduce on-disk days the fingerprint columns predate
 ```
 
@@ -164,8 +165,64 @@ the data provably is not what the source holds), a flagged day **is** what the
 source served — it is recorded, and consumers read it normally. The vault raises
 the question because it is the only place that can ask it cheaply; it must not
 answer it by discarding the day, since a genuine 30% change is exactly what an
-archive exists to keep. Deciding whether consumers need reimporting is the
-operator's call.
+archive exists to keep.
+
+### Answering a flag
+
+A flag is a question, and only a person can close it — unlike a refusal, which
+clears itself the moment a good pull lands. Until it is answered it sits in the
+list forever, so a vault that is never reviewed ends up with a Large-changes list
+that is mostly archaeology and gets skimmed.
+
+```
+addressvault review <slug> <date> artifact|schema|real -m "what it was"
+```
+
+| verdict | means |
+| --- | --- |
+| `artifact` | what arrived is not true of the world — a source replaying part of its own load, serving damage, or (for the seeding days) the vault's own history. No address changed. |
+| `schema` | the source really did change what it publishes, but not the addresses: fields added, removed or reshaped. Real, and still not an address change. |
+| `real` | the addresses really did move. |
+
+The note is required, and is the point: a verdict with no reasoning is a dismiss
+button, and a list that has been dismissed clean reads as "nothing outstanding"
+while being exactly as unexplained as before. When the same city moves the same
+way again, that note is what says what it turned out to be last time.
+
+Answering never edits. The bytes, the counts and the fingerprints are untouched
+and `data` keeps serving the day; the verdict is recorded alongside as a `jobs`
+row. The day keeps its purple cell too — it did move, and that stays true. What
+changes is that it leaves the open list and joins **Answered**, and the heading
+counts only what nobody has looked at yet.
+
+Only `real` is a story. Deciding what to *do* about a verdict — reimport,
+suppress, publish — belongs to the consumer, which is why this is a label and
+never a filter.
+
+### Reading the flags from a consumer
+
+`report --json` is the same data without the HTML, for something downstream
+asking "can I trust this day?":
+
+```
+addressvault report --json [--days N] [--out PATH]
+```
+
+```json
+{ "generated": "...", "today": "2026-08-19", "from": "2026-07-09",
+  "changes":  [ { "slug": "brant", "date": "2026-08-16",
+                  "why": "+5.2% features: 19,335 -> 20,335 (since 2026-08-15)",
+                  "verdict": "artifact", "note": "...", "reviewed_at": "..." } ],
+  "unmeasured": [ { "slug": "...", "date": "..." } ],
+  "refused":    [ { "slug": "...", "date": "...", "detail": "..." } ],
+  "failed":     [ { "slug": "...", "date": "...", "detail": "..." } ] }
+```
+
+`verdict` is `null` where nobody has looked yet, which is deliberately distinct
+from a verdict of `real`: one says the question is open, the other says a person
+answered it. This matters most to a publication built on the vault — a duplicate
+batch republished as "this city gained 1,000 addresses" is a fabricated story,
+and a flag nothing downstream can read is a flag that only protects the operator.
 
 ## What a pull refuses
 

@@ -26,6 +26,7 @@ import json
 import shutil
 import sys
 
+from addressvault.catalog import VERDICTS
 from addressvault.vault import Archived, PullInProgress, Vault
 
 # Offline/metered is not a pipeline failure -- same as if the laptop had been
@@ -162,8 +163,25 @@ def cmd_backfill(vault, args):
     print(f"  filled {len(filled)} snapshot(s)")
 
 
+def cmd_review(vault, args):
+    why = vault.review(args.slug, args.date, args.verdict, args.message)
+    print(f"  {args.slug} {args.date}: {args.verdict}")
+    print(f"    flagged for: {why}")
+
+
 def cmd_report(vault, args):
     from addressvault import report
+    if args.json:
+        from datetime import date as _date
+        data = report._collect(vault.cat, vault.root, args.days, _date.today())
+        out = json.dumps(report.to_json(data), indent=2)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(out)
+            print(f"  wrote {args.out}")
+        else:
+            print(out)
+        return
     path = report.build(vault, days=args.days, out=args.out)
     print(f"  wrote {path}")
 
@@ -202,9 +220,16 @@ def main(argv=None):
     sp = sub.add_parser("stats"); sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("backfill", help="reduce on-disk days the fingerprint columns predate")
     sp.add_argument("slug", nargs="*", help="limit to these slugs (default: all)")
+    sp = sub.add_parser("review", help="record what a flagged large change turned out to be")
+    sp.add_argument("slug"); sp.add_argument("date")
+    sp.add_argument("verdict", choices=VERDICTS)
+    sp.add_argument("-m", "--message", required=True, help="what it was")
+
     sp = sub.add_parser("report")
     sp.add_argument("--out", help="output path (default: <vault>/report.html)")
     sp.add_argument("--days", type=int, default=42)
+    sp.add_argument("--json", action="store_true",
+                    help="emit the report as data (for consumers) instead of HTML")
 
     args = p.parse_args(argv)
     # The batch entry points wait a bad link out (they are driven by a scheduler
@@ -217,7 +242,7 @@ def main(argv=None):
         "pull-due": cmd_pull_due, "serve": cmd_serve, "snapshots": cmd_snapshots,
         "data": cmd_data, "status": cmd_status, "thaw": cmd_thaw,
         "sweep": cmd_sweep, "stats": cmd_stats, "report": cmd_report,
-        "backfill": cmd_backfill,
+        "backfill": cmd_backfill, "review": cmd_review,
     }
     handlers[args.command](vault, args)
 

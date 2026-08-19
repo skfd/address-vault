@@ -54,6 +54,24 @@ CREATE TABLE IF NOT EXISTS leases(
 # wedged.
 TERMINAL_STATES = ("done", "failed", "refused", "deferred")
 
+# What a person can conclude about a flagged day, once they have looked at it.
+# The vault flags a large change but cannot say what it means; these are the
+# answers, recorded as `jobs` rows of kind "review" so no schema change is
+# needed and the verdict travels with the vault rather than with one consumer.
+#
+#   artifact  what arrived is not true of the world -- a source replaying part
+#             of its own load, serving damage, or (for the seeding days) the
+#             vault's own history. No address changed. Do not publish it.
+#   schema    the source really did change what it publishes, but not the
+#             addresses: fields added, removed or reshaped. Real, and still not
+#             an address change.
+#   real      the addresses really did move. Publish it.
+#
+# The distinction that matters downstream is that only "real" is a story. The
+# vault records which of the three it is; what to do about it belongs to the
+# consumer, which is why this is a label and never a filter.
+VERDICTS = ("artifact", "schema", "real")
+
 _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",
     "src_last_modified", "src_content_length",
@@ -242,6 +260,27 @@ class Catalog:
             (uuid.uuid4().hex, kind, slug, date, state, detail, now, now),
         )
         self.conn.commit()
+
+    def record_review(self, slug, date, verdict, note):
+        """Record a person's conclusion about a flagged day. See ``VERDICTS``."""
+        if verdict not in VERDICTS:
+            raise ValueError(f"verdict must be one of {', '.join(VERDICTS)}")
+        if not (note or "").strip():
+            # A verdict with no reasoning is a dismiss button, and a list that
+            # has been dismissed clean reads as "nothing outstanding" while
+            # being exactly as unexplained as before.
+            raise ValueError("a review needs a note saying what it was")
+        self.record_job("review", slug, date, verdict, detail=note.strip())
+
+    def reviews(self):
+        """``(slug, date) -> row`` of the latest verdict on each flagged day.
+
+        Later supersedes earlier: a day can be looked at again when more is
+        known, and the newest reading is the one that counts. Nothing is ever
+        deleted, so the earlier readings stay in the job log as history."""
+        return {(r["slug"], r["date"]): r for r in self.conn.execute(
+            "SELECT slug, date, state, detail, created_at FROM jobs "
+            "WHERE kind='review' ORDER BY created_at")}
 
     # --- leases (the per-slug single-writer gate) ---
     def acquire_lease(self, slug, kind, date, holder, ttl_seconds, state):

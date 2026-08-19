@@ -504,3 +504,82 @@ def test_a_field_disappearing_is_named_too(vault, http_dir):
     data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
     assert data["spikes"][("t", "2026-01-02")].startswith(
         "published fields changed: -AMAID")
+
+
+def _spiked(vault, http_dir):
+    """A vault with one flagged large change: t 2026-01-02, half the city gone."""
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 1000)
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    write_geojson(d, "addr.geojson", 500)
+    vault.pull("t", today="2026-01-02")
+
+
+def test_an_answered_change_leaves_the_open_list_but_keeps_its_cell(vault, http_dir):
+    from datetime import date
+
+    _spiked(vault, http_dir)
+    vault.review("t", "2026-01-02", "artifact",
+                 "source replayed a batch; corrected next morning")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    assert report._open_count(data) == 0        # nothing left to look at...
+    assert ("t", "2026-01-02") in data["spikes"]  # ...but the day still moved
+    assert report._cell(data, "t", "2026-01-02")[0] == report.SPIKED
+
+    page = open(report.build(vault, days=7, today=date(2026, 1, 2)), encoding="utf-8").read()
+    assert "Large changes (0)" in page
+    assert "Every large change in this window has been looked at." in page
+    assert "Answered (1)" in page
+    assert "source replayed a batch" in page  # the note is the payoff, not the dismissal
+
+
+def test_a_review_needs_a_reason_and_a_real_verdict(vault, http_dir):
+    _spiked(vault, http_dir)
+    with pytest.raises(ValueError, match="needs a note"):
+        vault.review("t", "2026-01-02", "artifact", "   ")
+    with pytest.raises(ValueError, match="verdict must be one of"):
+        vault.review("t", "2026-01-02", "probably-fine", "a note")
+
+
+def test_reviewing_a_day_that_is_not_flagged_is_refused(vault, http_dir):
+    # Almost always a mistyped date: the verdict is only ever read back against
+    # the large-change list, so it would be filed where nobody would see it.
+    _spiked(vault, http_dir)
+    with pytest.raises(LookupError, match="not a flagged large change"):
+        vault.review("t", "2026-01-01", "artifact", "a note")
+
+
+def test_a_later_reading_supersedes_an_earlier_one(vault, http_dir):
+    from datetime import date
+
+    _spiked(vault, http_dir)
+    vault.review("t", "2026-01-02", "artifact", "looks like a bad load")
+    vault.review("t", "2026-01-02", "real", "confirmed with the city: genuine")
+
+    data = report._collect(vault.cat, vault.root, 7, date(2026, 1, 2))
+    rv = data["reviews"][("t", "2026-01-02")]
+    assert rv["state"] == "real" and "confirmed with the city" in rv["detail"]
+
+
+def test_json_is_what_a_consumer_needs_to_trust_a_day(vault, http_dir):
+    from datetime import date
+
+    _spiked(vault, http_dir)
+    js = report.to_json(report._collect(vault.cat, vault.root, 7, date(2026, 1, 2)))
+    [chg] = js["changes"]
+    assert chg["slug"] == "t" and chg["date"] == "2026-01-02"
+    assert "-50.0% features" in chg["why"]
+    # Unanswered is not the same as answered "real": one is an open question.
+    assert chg["verdict"] is None and chg["note"] is None
+
+    vault.review("t", "2026-01-02", "schema", "a field was dropped, no addresses moved")
+    js = report.to_json(report._collect(vault.cat, vault.root, 7, date(2026, 1, 2)))
+    [chg] = js["changes"]
+    assert chg["verdict"] == "schema"
+    assert chg["note"] == "a field was dropped, no addresses moved"
+    assert chg["reviewed_at"]
+
+    import json as _json
+    _json.dumps(js)  # the whole contract has to survive a round trip

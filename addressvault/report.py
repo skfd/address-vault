@@ -126,6 +126,7 @@ def _collect(cat, root, days, today):
         "dates": dates, "slugs": slugs, "snaps": snaps, "fails": fails,
         "refused": refused, "current": current, "standing": standing,
         "log": log, "stats": cat.stats(), "spikes": spikes,
+        "reviews": cat.reviews(),
         "unmeasured": unmeasured, "storage": _storage(cat, root, dates),
     }
 
@@ -343,8 +344,14 @@ def _cell(data, slug, d):
         tier = tier.lstrip("+") or "recorded"
         why = data["spikes"].get((slug, d))
         if why:
+            # The cell stays purple once answered: the day did move, and that
+            # stays true. What the answer changes is whether anybody still owes
+            # it a look, which the tooltip and the section below now say.
+            rv = data["reviews"].get((slug, d))
+            verdict = (f" ANSWERED ({rv['state']}): {rv['detail']}." if rv
+                       else " Not yet looked at.")
             return SPIKED, (f"{slug} {d}: LARGE CHANGE, recorded and readable -- "
-                            f"{why}. {_human_bytes(s['bytes'])} ({tier})")
+                            f"{why}.{verdict} {_human_bytes(s['bytes'])} ({tier})")
         # Said on the cell as well as in the section below, because this is
         # where somebody asks what a green square means.
         blind = (" -- rewrites unchecked, no sketch on one side"
@@ -371,6 +378,41 @@ def _human_bytes(n):
         n /= 1024
 
 
+def to_json(data):
+    """The report as data, for a consumer rather than an operator.
+
+    ``report --json`` is how something downstream asks "can I trust this day?".
+    Until this existed the answer lived only in rendered HTML, so a consumer had
+    no way to reach it -- and the whole point of flagging a day is lost if the
+    thing that would publish it cannot see the flag.
+
+    ``verdict`` is null where nobody has looked yet. That is deliberately
+    distinct from a verdict of "real": one says the question is open, the other
+    says a person answered it. What a consumer does with either is its own
+    business; this reports, it does not prescribe.
+    """
+    changes = []
+    for (slug, d), why in sorted(data["spikes"].items()):
+        rv = data["reviews"].get((slug, d))
+        changes.append({
+            "slug": slug, "date": d, "why": why,
+            "verdict": rv["state"] if rv else None,
+            "note": rv["detail"] if rv else None,
+            "reviewed_at": rv["created_at"] if rv else None,
+        })
+    return {
+        "generated": data["generated"],
+        "today": data["today"],
+        "from": data["dates"][0],
+        "changes": changes,
+        "unmeasured": [{"slug": s, "date": d} for s, d in sorted(data["unmeasured"])],
+        "refused": [{"slug": s, "date": d, "detail": v}
+                    for (s, d), v in sorted(data["refused"].items())],
+        "failed": [{"slug": s, "date": d, "detail": v}
+                   for (s, d), v in sorted(data["fails"].items())],
+    }
+
+
 # --- rendering ---
 
 def _render(data):
@@ -386,7 +428,7 @@ def _render(data):
         "<h2>Pulls by city and day</h2>", _matrix(data),
         "<h2>Daily totals</h2>", _calendar(data),
         "<h2>Storage</h2>", _storage_section(data),
-        f"<h2>Large changes ({len(data['spikes'])})</h2>", _spikes(data),
+        f"<h2>Large changes ({_open_count(data)})</h2>", _spikes(data),
         "<h2>Failures</h2>", _failures(data),
         "<div id='tip' hidden></div>", _JS, "</body></html>",
     ]
@@ -563,24 +605,57 @@ def _unmeasured(data):
             f"covered them. Hover a cell to see which.</p>")
 
 
+def _open_count(data):
+    """Flagged days nobody has answered yet -- the heading is a to-do count."""
+    return sum(1 for k in data["spikes"] if k not in data["reviews"])
+
+
 def _spikes(data):
+    open_, done = [], []
+    for (slug, d), why in sorted(data["spikes"].items(),
+                                 key=lambda kv: kv[0][1], reverse=True):
+        (done if (slug, d) in data["reviews"] else open_).append((slug, d, why))
+
     if not data["spikes"]:
         return (f"<p class='sub'>No city's content moved by more than "
                 f"{SPIKE_FEATURES:.0%} in a day over this window.</p>"
                 + _unmeasured(data))
-    out = ["<p class='sub'>These days are recorded and readable -- unlike a "
-           "refusal, nothing was thrown away, and consumers will pull them "
-           "normally. They are listed because the content moved far enough that "
-           "it is worth deciding whether the source published something wrong, "
-           "or whether it really did change this much and consumers need "
-           "reimporting.</p>",
-           "<table class='fails spikes'><tr><th>city</th><th>day</th>"
-           "<th>what moved</th></tr>"]
-    for (slug, d), why in sorted(data["spikes"].items(),
-                                 key=lambda kv: kv[0][1], reverse=True):
-        out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d)}</td>"
-                   f"<td class='err'>{html.escape(why)}</td></tr>")
-    out.append("</table>")
+
+    out = []
+    if open_:
+        out.append("<p class='sub'>These days are recorded and readable -- unlike a "
+                   "refusal, nothing was thrown away, and consumers will pull them "
+                   "normally. They are listed because the content moved far enough "
+                   "that it is worth deciding whether the source published something "
+                   "wrong, or whether it really did change this much and consumers "
+                   "need reimporting. Answer one with "
+                   "<code>addressvault review &lt;city&gt; &lt;day&gt; "
+                   "&lt;verdict&gt; -m &quot;what it was&quot;</code>.</p>")
+        out.append("<table class='fails spikes'><tr><th>city</th><th>day</th>"
+                   "<th>what moved</th></tr>")
+        for slug, d, why in open_:
+            out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d)}</td>"
+                       f"<td class='err'>{html.escape(why)}</td></tr>")
+        out.append("</table>")
+    else:
+        out.append("<p class='sub'>Every large change in this window has been "
+                   "looked at.</p>")
+
+    if done:
+        # Kept, not hidden: the day did move, and the answer is worth more than
+        # the question was. When the same city moves the same way again, this is
+        # the row that says what it turned out to be last time.
+        out.append(f"<h3>Answered ({len(done)})</h3>")
+        out.append("<table class='fails spikes'><tr><th>city</th><th>day</th>"
+                   "<th>verdict</th><th>what it was</th></tr>")
+        for slug, d, _why in done:
+            rv = data["reviews"][(slug, d)]
+            out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d)}</td>"
+                       f"<td><span class='verdict {html.escape(rv['state'])}'>"
+                       f"{html.escape(rv['state'])}</span></td>"
+                       f"<td>{html.escape(rv['detail'] or '')}</td></tr>")
+        out.append("</table>")
+
     out.append(_unmeasured(data))
     return "".join(out)
 
@@ -736,6 +811,9 @@ h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink2); }
   color: var(--ink2); word-break: break-all; }
 h3.needs { color: var(--warn); }
 .fails.refused { border-color: var(--warn); border-left: 3px solid var(--warn); }
+.verdict { font-weight: 600; font-size: 11.5px; padding: 1px 6px; border-radius: 3px;
+  background: var(--spike-wash); color: var(--spike); white-space: nowrap; }
+.verdict.real { background: var(--good-wash); color: var(--good); }
 .fails tr.refused td { background: var(--warn-wash); }
 .fails.spikes { border-left: 3px solid var(--spike); }
 #tip { position: fixed; z-index: 9; background: var(--ink); color: var(--page);

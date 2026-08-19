@@ -404,6 +404,28 @@ class Vault:
                 self.cat.set_lease_state(slug, "done")
         return swept
 
+    def review(self, slug, date, verdict, note):
+        """Record what a person concluded about a flagged day (see ``VERDICTS``).
+
+        Refuses a day the report is not currently flagging. The verdict is only
+        ever read back against the large-change list, so recording one for a
+        quiet day silently files it where nobody will look -- much more likely a
+        typo in the date than a real intent.
+
+        This annotates; it never edits. The snapshot's bytes, its row counts and
+        its fingerprints are untouched, and ``data`` keeps serving the day to
+        anyone who asks. The vault records what the source served and, now, what
+        a person made of it -- deciding what to *do* about that belongs to the
+        consumer.
+        """
+        from addressvault import report
+        spikes, _ = report._churn(self.cat, "0000-01-01")
+        if (slug, date) not in spikes:
+            raise LookupError(
+                f"{slug} {date} is not a flagged large change; nothing to review")
+        self.cat.record_review(slug, date, verdict, note)
+        return spikes[(slug, date)]
+
     def backfill(self, slugs=None):
         """Fill the fingerprint columns for days whose file is still on disk.
 
