@@ -59,17 +59,29 @@ TERMINAL_STATES = ("done", "failed", "refused", "deferred")
 # answers, recorded as `jobs` rows of kind "review" so no schema change is
 # needed and the verdict travels with the vault rather than with one consumer.
 #
-#   artifact  what arrived is not true of the world -- a source replaying part
-#             of its own load, serving damage, or (for the seeding days) the
-#             vault's own history. No address changed. Do not publish it.
-#   schema    the source really did change what it publishes, but not the
-#             addresses: fields added, removed or reshaped. Real, and still not
-#             an address change.
+#   artifact  what tripped the flag is not true of the world -- a source
+#             replaying part of its own load, serving damage, or (for the
+#             seeding days) the vault's own history. Do not publish it.
+#   schema    the source really did change what it publishes: fields added,
+#             removed or reshaped. Real, and not in itself an address change.
 #   real      the addresses really did move. Publish it.
 #
 # The distinction that matters downstream is that only "real" is a story. The
 # vault records which of the three it is; what to do about it belongs to the
 # consumer, which is why this is a label and never a filter.
+#
+# A verdict names what the day most consequentially was, and one day can be
+# more than one thing -- huron 2026-08-22 added a column *and* seven addresses.
+# It deliberately does NOT claim the rest of the day stood still: for two
+# months renfrew 2026-06-29 read as `schema` while carrying 27 new rows, and
+# the wording here ("no address changed") was part of why nobody looked.
+#
+# So the verdict is never the whole account. ``report --json`` carries
+# ``addresses`` on every flagged day -- net movement and rewrite share, as
+# numbers, whatever the verdict says -- precisely so a label cannot conceal
+# what moved underneath it. Read the two together; a `schema` or `artifact`
+# day with non-zero net movement is a normal reading, not a contradiction,
+# and matters because those two are what a consumer suppresses on.
 VERDICTS = ("artifact", "schema", "real")
 
 _SNAP_COLS = (
