@@ -506,6 +506,28 @@ def test_a_field_disappearing_is_named_too(vault, http_dir):
         "published fields changed: -AMAID")
 
 
+def test_a_flagged_day_says_what_its_addresses_did(vault, http_dir):
+    # renfrew 2026-06-29 was filed `schema` for editor-metadata fields appearing
+    # and carried 27 new rows nobody mentioned: the first test to fire ends the
+    # search, so the flag never said whether an address had moved -- the one
+    # thing the verdict turns on. A day caught by any test now carries the
+    # answer, even when a different test found it.
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 1000)
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    _write_addresses(d, 1005, STATUS="active")   # a new field AND five new addresses
+    vault.pull("t", today="2026-01-02")
+
+    why = report._collect(vault.cat, vault.root, 7,
+                          date(2026, 1, 2))["spikes"][("t", "2026-01-02")]
+    assert why.startswith("published fields changed: +STATUS")
+    assert "+5 addresses" in why      # the growth the field change would have hidden
+    assert "rewritten" in why
+
+
 def _spiked(vault, http_dir):
     """A vault with one flagged large change: t 2026-01-02, half the city gone."""
     base, d = http_dir

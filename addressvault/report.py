@@ -131,6 +131,36 @@ def _collect(cat, root, days, today):
     }
 
 
+def _addr_move(p, r):
+    """How the addresses themselves moved, said for a day flagged by another test.
+
+    A flag fires on the first test that matches and then stops, so a day caught
+    by the field list or the byte divergence never said whether a single address
+    moved -- which is the one thing the verdict turns on. renfrew 2026-06-29 was
+    filed `schema` for three editor-metadata fields appearing and carried 27 new
+    rows nobody mentioned, and it took two months and a hand-run sketch compare
+    to notice. The address tests are cheap once a day is already flagged (two
+    8 KB sketches), so they run anyway and the answer travels with the question.
+    """
+    if p["distinct_addresses"] and r["distinct_addresses"]:
+        net, what = r["distinct_addresses"] - p["distinct_addresses"], "addresses"
+    else:
+        net, what = r["features"] - p["features"], "rows"
+    if p["sketch"] and r["sketch"]:
+        moved = f"{sketch.churn(sketch.decode(p['sketch']), sketch.decode(r['sketch'])):.3%} rewritten"
+    else:
+        # Same blindness the `blind` flag reports for quiet days: one side of the
+        # comparison predates sketching. Said out loud rather than left as a gap,
+        # because "no rewrites mentioned" would otherwise read as "no rewrites".
+        moved = "rewrite share unmeasured"
+    return f"{net:+,} {what}, {moved}"
+
+
+def _flag(why, p, r):
+    """A flagged day plus what its addresses did. See ``_addr_move``."""
+    return f"{why} -- {_addr_move(p, r)}", False
+
+
 def _spike(p, r):
     """``(why, blind)`` for day ``r`` against the previous snapshot ``p``.
 
@@ -154,6 +184,10 @@ def _spike(p, r):
     size as well as count slips past every one: the sketch comparison sees that
     case, and is checked last because it is the only test needing a stored
     fingerprint and so is blind to days pulled before sketching existed.
+
+    The search stops at the first test that matches, but the address tests run
+    anyway once a day is flagged, so the flag says what the addresses did even
+    when a different test is what found the day. See ``_addr_move``.
     """
     if p["sha256"] and r["sha256"] == p["sha256"]:
         # Byte-identical to the day before: nothing moved, and no fingerprint is
@@ -169,18 +203,18 @@ def _spike(p, r):
         return f"{r['features']:,} features, up from an empty snapshot ({p['date']})", False
     df = (r["features"] - p["features"]) / p["features"]
     if abs(df) >= SPIKE_FEATURES:
-        return (f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
-                f"(since {p['date']})"), False
+        return _flag(f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
+                     f"(since {p['date']})", p, r)
     if p["distinct_addresses"] and r["distinct_addresses"]:
         # Duplicate rows: rows the source published twice. A level here is
         # normal and source-specific; a *move* is the source replaying a batch.
         dup_p = (p["features"] - p["distinct_addresses"]) / p["features"]
         dup_r = (r["features"] - r["distinct_addresses"]) / r["features"]
         if abs(dup_r - dup_p) >= SPIKE_DUPLICATES:
-            return (f"{dup_r - dup_p:+.1%} duplicate rows: "
-                    f"{p['features'] - p['distinct_addresses']:,} -> "
-                    f"{r['features'] - r['distinct_addresses']:,} rows repeat an "
-                    f"address already in the file (since {p['date']})"), False
+            return _flag(f"{dup_r - dup_p:+.1%} duplicate rows: "
+                         f"{p['features'] - p['distinct_addresses']:,} -> "
+                         f"{r['features'] - r['distinct_addresses']:,} rows repeat an "
+                         f"address already in the file (since {p['date']})", p, r)
     if p["field_names"] and r["field_names"]:
         # A schema change, not a data change. Named rather than measured: the
         # size move it causes says nothing a consumer can act on, and the field
@@ -190,13 +224,13 @@ def _spike(p, r):
         if was != now:
             moved = [f"+{f}" for f in sorted(now - was)]
             moved += [f"-{f}" for f in sorted(was - now)]
-            return (f"published fields changed: {', '.join(moved)} "
-                    f"(since {p['date']})"), False
+            return _flag(f"published fields changed: {', '.join(moved)} "
+                         f"(since {p['date']})", p, r)
     if p["bytes"]:
         db = (r["bytes"] - p["bytes"]) / p["bytes"]
         if abs(db - df) >= SPIKE_DIVERGENCE:
-            return (f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
-                    f"place, not added or dropped (since {p['date']})"), False
+            return _flag(f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
+                          f"place, not added or dropped (since {p['date']})", p, r)
     if not p["sketch"] or not r["sketch"]:
         return None, True  # the content changed and we cannot say by how much
     rewritten = sketch.churn(sketch.decode(p["sketch"]), sketch.decode(r["sketch"]))
