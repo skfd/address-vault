@@ -419,7 +419,7 @@ class Vault:
         consumer.
         """
         from addressvault import report
-        spikes, _ = report._churn(self.cat, "0000-01-01")
+        spikes, _, _ = report._churn(self.cat, "0000-01-01")
         if (slug, date) not in spikes:
             raise LookupError(
                 f"{slug} {date} is not a flagged large change; nothing to review")

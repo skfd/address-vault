@@ -268,15 +268,18 @@ def test_recovery_from_an_empty_snapshot_is_a_spike():
     # the feature counts these two cases turn on.
     empty = {"date": "2026-06-26", "sha256": "e0", "features": 0, "bytes": 0,
              "sketch": None}
-    why, blind = report._spike(empty, {"date": "2026-06-28", "sha256": "a1",
-                                       "features": 525451, "bytes": 589258096,
-                                       "sketch": None})
+    why, blind, info = report._spike(
+        empty, {"date": "2026-06-28", "sha256": "a1", "features": 525451,
+                "bytes": 589258096, "sketch": None})
     assert why.startswith("525,451 features, up from an empty snapshot")
     assert not blind  # a call this loud does not need the sketch to be sure
+    # No baseline means no address delta to report -- null, not a zero that
+    # would read as "measured, nothing moved".
+    assert info == {"test": "baseline", "addresses": None}
     # ...but a run of empty days is one flat line, not a spike every morning.
     assert report._spike(empty, {"date": "2026-06-27", "sha256": "e1",
                                  "features": 0, "bytes": 0,
-                                 "sketch": None}) == (None, False)
+                                 "sketch": None}) == (None, False, None)
 
 
 def test_build_writes_large_changes_section(vault, http_dir):
@@ -605,3 +608,30 @@ def test_json_is_what_a_consumer_needs_to_trust_a_day(vault, http_dir):
 
     import json as _json
     _json.dumps(js)  # the whole contract has to survive a round trip
+
+
+def test_a_verdict_cannot_hide_what_the_addresses_did(vault, http_dir):
+    # The verdict answers the flag, and one day can be more than one thing:
+    # renfrew 2026-06-29 was filed `schema` for editor-metadata fields appearing
+    # while 27 new rows rode along unmentioned. Downstream, `schema` maps to a
+    # suppression that holds forever, so a mixed day read as one enum buries the
+    # growth. The finding travels beside the verdict as data, not inside it.
+    from datetime import date
+
+    base, d = http_dir
+    _write_addresses(d, 1000)
+    _add(vault, base, fields=ADDR_FIELDS)
+    vault.pull("t", today="2026-01-01")
+    _write_addresses(d, 1005, STATUS="active")
+    vault.pull("t", today="2026-01-02")
+    vault.review("t", "2026-01-02", "schema", "the city added a STATUS column")
+
+    [chg] = report.to_json(
+        report._collect(vault.cat, vault.root, 7, date(2026, 1, 2)))["changes"]
+    assert chg["verdict"] == "schema"          # what the flag turned out to be
+    assert chg["test"] == "fields"             # ...and which check found it,
+    assert chg["addresses"]["net"] == 5        # ...and the growth it does not
+    assert chg["addresses"]["unit"] == "addresses"   # speak for.
+    # Measured, and small: five arrivals do move the sketch, so this is not the
+    # 0.0 of "nothing happened" nor the None of "could not tell".
+    assert 0 < chg["addresses"]["rewritten"] < 0.01

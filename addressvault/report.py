@@ -118,21 +118,21 @@ def _collect(cat, root, days, today):
         "ORDER BY created_at DESC LIMIT 100"
     ).fetchall()
 
-    spikes, unmeasured = _churn(cat, frm)
+    spikes, unmeasured, flags = _churn(cat, frm)
 
     return {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "today": today.isoformat(),
         "dates": dates, "slugs": slugs, "snaps": snaps, "fails": fails,
         "refused": refused, "current": current, "standing": standing,
-        "log": log, "stats": cat.stats(), "spikes": spikes,
+        "log": log, "stats": cat.stats(), "spikes": spikes, "flags": flags,
         "reviews": cat.reviews(),
         "unmeasured": unmeasured, "storage": _storage(cat, root, dates),
     }
 
 
-def _addr_move(p, r):
-    """How the addresses themselves moved, said for a day flagged by another test.
+def _addr_facts(p, r):
+    """What the addresses themselves did, for a day flagged by another test.
 
     A flag fires on the first test that matches and then stops, so a day caught
     by the field list or the byte divergence never said whether a single address
@@ -141,28 +141,48 @@ def _addr_move(p, r):
     rows nobody mentioned, and it took two months and a hand-run sketch compare
     to notice. The address tests are cheap once a day is already flagged (two
     8 KB sketches), so they run anyway and the answer travels with the question.
+
+    Returned as data rather than only prose: the verdict is one enum and a
+    sentence, and a mixed day is exactly where a sentence gets skimmed.
+    ``rewritten`` is None where one side predates sketching -- not 0.0, which
+    would be a different and false claim.
     """
     if p["distinct_addresses"] and r["distinct_addresses"]:
-        net, what = r["distinct_addresses"] - p["distinct_addresses"], "addresses"
+        net, unit = r["distinct_addresses"] - p["distinct_addresses"], "addresses"
     else:
-        net, what = r["features"] - p["features"], "rows"
+        # Before distinct_addresses existed there is only the row count, which
+        # is not the same claim -- so it is named differently rather than
+        # passed off as a count of addresses.
+        net, unit = r["features"] - p["features"], "rows"
+    rewritten = None
     if p["sketch"] and r["sketch"]:
-        moved = f"{sketch.churn(sketch.decode(p['sketch']), sketch.decode(r['sketch'])):.3%} rewritten"
-    else:
-        # Same blindness the `blind` flag reports for quiet days: one side of the
-        # comparison predates sketching. Said out loud rather than left as a gap,
-        # because "no rewrites mentioned" would otherwise read as "no rewrites".
-        moved = "rewrite share unmeasured"
-    return f"{net:+,} {what}, {moved}"
+        rewritten = sketch.churn(sketch.decode(p["sketch"]), sketch.decode(r["sketch"]))
+    return {"net": net, "unit": unit, "rewritten": rewritten}
 
 
-def _flag(why, p, r):
-    """A flagged day plus what its addresses did. See ``_addr_move``."""
-    return f"{why} -- {_addr_move(p, r)}", False
+def _addr_prose(facts):
+    """``_addr_facts`` as the clause appended to a flag. A missing measurement
+    stays speakable: the same blindness ``blind`` reports for quiet days, said
+    out loud, because "no rewrites mentioned" reads as "no rewrites"."""
+    moved = ("rewrite share unmeasured" if facts["rewritten"] is None
+             else f"{facts['rewritten']:.3%} rewritten")
+    return f"{facts['net']:+,} {facts['unit']}, {moved}"
+
+
+def _flag(why, p, r, test):
+    """``(why, blind, info)``: the finding as prose, and the same finding as
+    data. ``test`` names the check that found the day so a consumer can branch
+    on it without parsing the sentence. See ``_addr_facts``."""
+    facts = _addr_facts(p, r)
+    return (f"{why} -- {_addr_prose(facts)}", False,
+            {"test": test, "addresses": facts})
 
 
 def _spike(p, r):
-    """``(why, blind)`` for day ``r`` against the previous snapshot ``p``.
+    """``(why, blind, info)`` for day ``r`` against the previous snapshot ``p``.
+
+    ``info`` is the same finding as data -- which test fired, and what the
+    addresses did -- or None for a day that is not flagged. See ``_flag``.
 
     ``why`` says how far the content moved, or is None if it moved no more than
     a city normally does in a day. ``blind`` says the day cleared both scalar
@@ -194,17 +214,19 @@ def _spike(p, r):
         # needed to say so. Worth short-circuiting, or every dedup day reaching
         # back past sketching would be reported unmeasured when it is provably
         # unchanged.
-        return None, False
+        return None, False, None
     if not p["features"]:
         # No baseline to be relative to: the previous day recorded nothing. Any
         # content at all is a mass change against an empty snapshot.
         if not r["features"]:
-            return None, False  # empty then, empty now -- nothing moved
-        return f"{r['features']:,} features, up from an empty snapshot ({p['date']})", False
+            return None, False, None  # empty then, empty now -- nothing moved
+        # No baseline to be relative to means no address delta either.
+        return (f"{r['features']:,} features, up from an empty snapshot "
+                f"({p['date']})"), False, {"test": "baseline", "addresses": None}
     df = (r["features"] - p["features"]) / p["features"]
     if abs(df) >= SPIKE_FEATURES:
         return _flag(f"{df:+.1%} features: {p['features']:,} -> {r['features']:,} "
-                     f"(since {p['date']})", p, r)
+                     f"(since {p['date']})", p, r, "features")
     if p["distinct_addresses"] and r["distinct_addresses"]:
         # Duplicate rows: rows the source published twice. A level here is
         # normal and source-specific; a *move* is the source replaying a batch.
@@ -214,7 +236,7 @@ def _spike(p, r):
             return _flag(f"{dup_r - dup_p:+.1%} duplicate rows: "
                          f"{p['features'] - p['distinct_addresses']:,} -> "
                          f"{r['features'] - r['distinct_addresses']:,} rows repeat an "
-                         f"address already in the file (since {p['date']})", p, r)
+                         f"address already in the file (since {p['date']})", p, r, "duplicates")
     if p["field_names"] and r["field_names"]:
         # A schema change, not a data change. Named rather than measured: the
         # size move it causes says nothing a consumer can act on, and the field
@@ -225,26 +247,30 @@ def _spike(p, r):
             moved = [f"+{f}" for f in sorted(now - was)]
             moved += [f"-{f}" for f in sorted(was - now)]
             return _flag(f"published fields changed: {', '.join(moved)} "
-                         f"(since {p['date']})", p, r)
+                         f"(since {p['date']})", p, r, "fields")
     if p["bytes"]:
         db = (r["bytes"] - p["bytes"]) / p["bytes"]
         if abs(db - df) >= SPIKE_DIVERGENCE:
             return _flag(f"{db:+.1%} bytes on {df:+.1%} features: rows rewritten in "
-                          f"place, not added or dropped (since {p['date']})", p, r)
+                          f"place, not added or dropped (since {p['date']})", p, r, "bytes")
     if not p["sketch"] or not r["sketch"]:
-        return None, True  # the content changed and we cannot say by how much
+        return None, True, None  # the content changed and we cannot say by how much
     rewritten = sketch.churn(sketch.decode(p["sketch"]), sketch.decode(r["sketch"]))
     if rewritten >= SPIKE_CHURN:
-        return (f"{rewritten:.1%} of addresses rewritten on {df:+.1%} features "
-                f"and no size change to show for it (since {p['date']})"), False
-    return None, False
+        # Already an address measurement, so it states itself rather than
+        # repeating the clause the other tests append.
+        return ((f"{rewritten:.1%} of addresses rewritten on {df:+.1%} features "
+                 f"and no size change to show for it (since {p['date']})"), False,
+                {"test": "churn", "addresses": _addr_facts(p, r)})
+    return None, False, None
 
 
 def _churn(cat, frm):
-    """``(spikes, unmeasured)``: which days moved far enough to want a person,
-    and which ones the vault could not finish asking about.
+    """``(spikes, unmeasured, flags)``: which days moved far enough to want a
+    person, and which ones the vault could not finish asking about.
 
-    ``spikes`` maps (slug, date) -> why. ``unmeasured`` is the set of (slug,
+    ``spikes`` maps (slug, date) -> why, and ``flags`` the same keys -> the
+    finding as data (see ``_flag``). ``unmeasured`` is the set of (slug,
     date) whose content changed but whose rewrite share could not be measured,
     because one side of the comparison predates sketching. They are held apart
     from the quiet days rather than folded in with them: a report that cannot
@@ -275,18 +301,19 @@ def _churn(cat, frm):
         "AND p.date<?) ORDER BY slug, date", (frm, frm)
     ).fetchall()
 
-    spikes, unmeasured, prev = {}, set(), {}
+    spikes, unmeasured, flags, prev = {}, set(), {}, {}
     for r in rows:
         p = prev.get(r["slug"])
         prev[r["slug"]] = r
         if p is None or r["date"] < frm:
             continue  # the pre-window baseline is a yardstick, not a finding
-        why, blind = _spike(p, r)
+        why, blind, info = _spike(p, r)
         if why:
             spikes[(r["slug"], r["date"])] = why
+            flags[(r["slug"], r["date"])] = info
         elif blind:
             unmeasured.add((r["slug"], r["date"]))
-    return spikes, unmeasured
+    return spikes, unmeasured, flags
 
 
 def _storage(cat, root, dates):
@@ -424,12 +451,24 @@ def to_json(data):
     distinct from a verdict of "real": one says the question is open, the other
     says a person answered it. What a consumer does with either is its own
     business; this reports, it does not prescribe.
+
+    A verdict answers the flag, and one day can be more than one thing: huron
+    2026-08-22 added a column *and* seven addresses, renfrew 2026-06-29 was
+    filed `schema` while carrying 27 new rows. So the finding travels beside
+    the verdict rather than inside it -- ``test`` names the check that fired
+    and ``addresses`` says what moved, both machine-readable, so a consumer
+    reading `schema` cannot thereby miss the growth. ``addresses`` is null
+    where no baseline existed to measure against, and its ``rewritten`` is null
+    where one side predates sketching; neither is the same as zero.
     """
     changes = []
     for (slug, d), why in sorted(data["spikes"].items()):
         rv = data["reviews"].get((slug, d))
+        info = (data.get("flags") or {}).get((slug, d)) or {}
         changes.append({
             "slug": slug, "date": d, "why": why,
+            "test": info.get("test"),
+            "addresses": info.get("addresses"),
             "verdict": rv["state"] if rv else None,
             "note": rv["detail"] if rv else None,
             "reviewed_at": rv["created_at"] if rv else None,
