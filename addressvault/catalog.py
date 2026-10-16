@@ -273,6 +273,42 @@ class Catalog:
         )
         self.conn.commit()
 
+    def failure_streaks(self):
+        """``slug -> {"days", "since", "last_good", "detail"}`` for every city
+        whose most recent pull day ended without a successful pull.
+
+        ``days`` counts consecutive pull days, newest first, on which every pull
+        failed or was refused -- one success anywhere in a day (a retry, an
+        off-schedule pull) ends it. Days with no pull at all (machine off, link
+        down) are skipped rather than counted or treated as a break: they say
+        nothing about the source. This is the number that tells a source that
+        hiccuped today from one that has been down for three weeks
+        (west-parry-sound, 2026-09-24..10-15), which the per-day matrix shows
+        only as a row of red cells."""
+        days = {}
+        for r in self.conn.execute(
+                "SELECT slug, date, MAX(state='done') AS ok FROM jobs "
+                "WHERE kind='pull' AND state IN ('done','failed','refused') "
+                "GROUP BY slug, date ORDER BY slug, date DESC"):
+            days.setdefault(r["slug"], []).append((r["date"], bool(r["ok"])))
+        out = {}
+        for slug, rows in days.items():
+            n = 0
+            for _, ok in rows:
+                if ok:
+                    break
+                n += 1
+            if not n:
+                continue
+            last_good = next((d for d, ok in rows if ok), None)
+            detail = self.conn.execute(
+                "SELECT detail FROM jobs WHERE kind='pull' AND slug=? "
+                "AND state IN ('failed','refused') ORDER BY created_at DESC LIMIT 1",
+                (slug,)).fetchone()
+            out[slug] = {"days": n, "since": rows[n - 1][0], "last_good": last_good,
+                         "detail": detail["detail"] if detail else ""}
+        return out
+
     def record_review(self, slug, date, verdict, note):
         """Record a person's conclusion about a flagged day. See ``VERDICTS``."""
         if verdict not in VERDICTS:

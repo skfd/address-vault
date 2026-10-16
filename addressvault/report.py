@@ -128,6 +128,7 @@ def _collect(cat, root, days, today):
         "log": log, "stats": cat.stats(), "spikes": spikes, "flags": flags,
         "reviews": cat.reviews(),
         "unmeasured": unmeasured, "storage": _storage(cat, root, dates),
+        "streaks": cat.failure_streaks(),
     }
 
 
@@ -483,6 +484,8 @@ def to_json(data):
                     for (s, d), v in sorted(data["refused"].items())],
         "failed": [{"slug": s, "date": d, "detail": v}
                    for (s, d), v in sorted(data["fails"].items())],
+        # Cities whose latest pull day failed, with how many pull days in a row.
+        "streaks": [{"slug": s, **v} for s, v in sorted(data.get("streaks", {}).items())],
     }
 
 
@@ -756,10 +759,20 @@ def _failures(data):
     if data["current"]:
         out.append(f"<h3>Cities whose last pull failed ({len(data['current'])})</h3>")
         out.append("<table class='fails'><tr><th>city</th><th>day</th>"
-                   "<th>when</th><th>error</th></tr>")
-        for slug, d, detail, at in data["current"]:
+                   "<th>when</th><th>down</th><th>error</th></tr>")
+        streaks = data.get("streaks", {})
+        # Longest outage first: a city down for weeks is the row to act on, and
+        # one that hiccuped today usually clears by itself tomorrow.
+        rows = sorted(data["current"],
+                      key=lambda r: -streaks.get(r[0], {}).get("days", 0))
+        for slug, d, detail, at in rows:
+            st = streaks.get(slug)
+            down = (f"{st['days']} day{'s' if st['days'] != 1 else ''}"
+                    f"{' since ' + st['last_good'] if st.get('last_good') else ''}"
+                    if st else "")
             out.append(f"<tr><td>{html.escape(slug)}</td><td>{html.escape(d or '')}</td>"
                        f"<td>{html.escape((at or '')[:16])}</td>"
+                       f"<td>{html.escape(down)}</td>"
                        f"<td class='err'>{html.escape(detail)}</td></tr>")
         out.append("</table>")
     else:

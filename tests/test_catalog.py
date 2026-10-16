@@ -114,3 +114,28 @@ def test_backfill_reduces_on_disk_days_and_dedup_days_inherit(vault, http_dir):
     for col in ("sketch", "distinct_addresses", "field_names"):
         assert dedup[col] == canon[col], col
     assert vault.backfill() == []  # nothing left to do; safe to re-run
+
+
+def test_failure_streak_counts_consecutive_pull_days_without_a_success(tmp_path):
+    cat = _cat(tmp_path)
+    cat.record_job("pull", "wps", "2026-10-01", "done")
+    for d in ("2026-10-02", "2026-10-03", "2026-10-05"):  # 10-04: machine off
+        cat.record_job("pull", "wps", d, "failed", detail="first")
+        cat.record_job("pull", "wps", d, "failed", detail="not started")
+    # A city that failed in the morning and recovered on a retry is not down.
+    cat.record_job("pull", "guelph", "2026-10-05", "failed", detail="500")
+    cat.record_job("pull", "guelph", "2026-10-05", "done")
+    cat.record_job("pull", "kingston", "2026-10-05", "refused", detail="truncated")
+
+    s = cat.failure_streaks()
+    assert set(s) == {"wps", "kingston"}
+    assert s["wps"] == {"days": 3, "since": "2026-10-02", "last_good": "2026-10-01",
+                        "detail": "not started"}
+    assert s["kingston"]["days"] == 1 and s["kingston"]["last_good"] is None
+
+
+def test_review_jobs_do_not_count_toward_a_streak(tmp_path):
+    cat = _cat(tmp_path)
+    cat.record_job("pull", "brant", "2026-10-05", "done")
+    cat.record_review("brant", "2026-10-06", "schema", "fields changed")
+    assert cat.failure_streaks() == {}
