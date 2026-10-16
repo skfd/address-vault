@@ -40,6 +40,54 @@ COUNT_TOLERANCE = 0.01
 # the rows are real, the geometry is real, only there are too many of them.
 OVERCOUNT_TOLERANCE = 0.02
 
+# The second, short retry tier: for the server answering *badly* rather than not
+# answering. RETRIES above covers a connection that will not open (ottawa's F5
+# block), and waits it out for 15 min. Everything below used to fail the city on
+# the spot instead, and over 2026-07-19..10-15 it was nearly every failure we had:
+# simcoe 503s, guelph's mid-page 500, kingston's "Error invoking service" and
+# milton's "Wait time ... expired" error bodies, cambridge's empty first page,
+# IncompleteRead clusters, HTML served where JSON was asked for. Almost all of
+# them cleared within the 15 min the outer daily loop waits -- but that loop
+# re-runs every city, not just the one that hiccuped. One budget per fetch,
+# shared by metadata, count and pages, so a layer that limps page after page
+# still gives up in bounded time (7.5 min of waiting in all).
+FLAKE_WAITS = (30, 60, 120, 240)
+_FLAKE_STATUS = {500, 502, 503, 504}
+# A 500 that says the service is stopped or gone is not a flake: it will not
+# clear in minutes (west-parry-sound, "Service ... not started", 22 days), and
+# waiting it out only lengthens every run it fails in.
+_DEAD_SERVICE = ("not started", "does not exist")
+
+
+class ArcgisError(ValueError):
+    """An ArcGIS error body served under HTTP 200. Still a ValueError, and its
+    text is unchanged, so callers that read or record str(e) see what they did."""
+
+    def __init__(self, code, message):
+        try:
+            self.code = int(code)
+        except (TypeError, ValueError):
+            self.code = None
+        self.message = str(message)
+        super().__init__(f"arcgis error {code}: {message}")
+
+
+class EmptyFirstPage(ValueError):
+    pass
+
+
+def is_flake(exc):
+    """True for a server-side failure worth a short wait and a second try."""
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        return resp is not None and resp.status_code in _FLAKE_STATUS
+    if isinstance(exc, ArcgisError):
+        msg = exc.message.lower()
+        return exc.code in _FLAKE_STATUS and not any(m in msg for m in _DEAD_SERVICE)
+    return isinstance(exc, (requests.exceptions.ChunkedEncodingError,
+                            requests.exceptions.JSONDecodeError,
+                            EmptyFirstPage))
+
 
 def _json(r):
     """Parse a response, rejecting the error bodies ArcGIS serves under HTTP 200.
@@ -52,8 +100,7 @@ def _json(r):
     body = r.json()
     if isinstance(body, dict) and "error" in body:
         err = body["error"] if isinstance(body["error"], dict) else {}
-        raise ValueError(f"arcgis error {err.get('code', '?')}: "
-                         f"{err.get('message') or body['error']}")
+        raise ArcgisError(err.get("code", "?"), err.get("message") or body["error"])
     return body
 
 
@@ -73,11 +120,14 @@ def _count(session, url):
     blank by accident (kitchener 2026-07-28 stopped at 102,000 of 131,912, huron
     at 20,000 of 38,300 -- both exact multiples of the page size). A layer that
     refuses the query is left unchecked rather than failed; that is the older,
-    weaker guarantee, not a new failure."""
+    weaker guarantee, not a new failure. A flake is raised, not swallowed, so
+    the caller can give it the short retry tier first."""
     try:
         body = _query(session, url, {"where": "1=1", "returnCountOnly": "true",
                                      "f": "json"})
     except ValueError as e:  # error body under HTTP 200: query unsupported here
+        if is_flake(e):
+            raise
         print(f"  count probe rejected ({e}); pull size cannot be verified")
         return None
     n = body.get("count")
@@ -127,6 +177,25 @@ def fetch(source, dest_dir, *, force=False, today=None):
         time.sleep(RETRY_WAIT)
         session = requests.Session()
 
+    flakes = 0
+
+    def _flake(exc, what):
+        """The short tier: re-raise anything that is not a flake, or once the
+        per-fetch budget is spent; otherwise wait a little and go again on a
+        fresh Session."""
+        nonlocal flakes, session
+        if not is_flake(exc):
+            raise exc
+        net.wait_for_link(wait=False)
+        if flakes >= len(FLAKE_WAITS):
+            raise exc
+        wait = FLAKE_WAITS[flakes]
+        flakes += 1
+        print(f"\n  {what}: {exc}; retrying in {wait}s "
+              f"(flake {flakes}/{len(FLAKE_WAITS)})")
+        time.sleep(wait)
+        session = requests.Session()
+
     # The metadata call draws on the same budget as a page: it is just as
     # droppable, and a blip on this first request used to cost the whole city.
     # The count probe rides along in the same attempt -- it is the same kind of
@@ -135,10 +204,26 @@ def fetch(source, dest_dir, *, force=False, today=None):
     while True:
         try:
             meta = _layer_meta(session, source.data_url)
-            expected = _count(session, source.data_url)
             break
         except (requests.ConnectionError, requests.Timeout) as e:
             _pause(e, f"{source.slug} metadata unreachable")
+        except Exception as e:
+            _flake(e, f"{source.slug} metadata")
+    while True:
+        try:
+            expected = _count(session, source.data_url)
+            break
+        except (requests.ConnectionError, requests.Timeout) as e:
+            _pause(e, f"{source.slug} count probe unreachable")
+        except Exception as e:
+            # A count that keeps flaking after the short tier falls back to the
+            # older guarantee -- pull unverified -- rather than failing a city
+            # whose pages may answer fine. Anything else still fails, as before.
+            if is_flake(e) and flakes >= len(FLAKE_WAITS):
+                print(f"  count probe failed ({e}); pull size cannot be verified")
+                expected = None
+                break
+            _flake(e, f"{source.slug} count probe")
 
     page = min(meta.get("maxRecordCount") or DEFAULT_PAGE, DEFAULT_PAGE)
     can_geojson = "geoJSON" in (meta.get("supportedQueryFormats") or "")
@@ -157,18 +242,24 @@ def fetch(source, dest_dir, *, force=False, today=None):
         }
         try:
             data = _query(session, source.data_url, params)
-        except (requests.ConnectionError, requests.Timeout) as e:
-            _pause(e, f"stalled at {len(features):,} features; "
-                      f"resuming past {oid_field} {last_oid}")
-            continue
-        batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
-        if not batch:
+            batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
             # An empty page only terminates once we hold rows. No address layer
             # is legitimately empty, so an empty *first* page is the source
             # failing in some way the error check above did not catch -- fail
             # loudly instead of recording today as a city with no addresses.
-            if not features:
-                raise ValueError("first page returned no features")
+            # (cambridge did this on three days and answered fully minutes later,
+            # so it gets the short tier before it fails.)
+            if not batch and not features:
+                raise EmptyFirstPage("first page returned no features")
+        except (requests.ConnectionError, requests.Timeout) as e:
+            _pause(e, f"stalled at {len(features):,} features; "
+                      f"resuming past {oid_field} {last_oid}")
+            continue
+        except Exception as e:
+            _flake(e, f"{source.slug} page past {oid_field} {last_oid} "
+                      f"({len(features):,} held)")
+            continue
+        if not batch:
             break
         features.extend(batch)
         last_oid = _max_oid(batch, oid_field)

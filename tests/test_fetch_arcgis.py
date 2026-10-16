@@ -17,6 +17,7 @@ META = {"maxRecordCount": 2, "supportedQueryFormats": "JSON,geoJSON",
 @pytest.fixture(autouse=True)
 def no_wait(monkeypatch):
     monkeypatch.setattr(arcgis, "RETRY_WAIT", 0)
+    monkeypatch.setattr(arcgis, "FLAKE_WAITS", (0, 0, 0, 0))
 
 
 def _src():
@@ -221,3 +222,154 @@ def test_rows_added_while_paging_stay_inside_the_overcount_tolerance(tmp_path, m
     monkeypatch.setattr(arcgis, "_count", lambda s, u: 300)  # 2% of 300 == 6
     _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 302
+
+
+# ---- the short retry tier: the server answering badly, not failing to answer ----
+
+def _http_error(status):
+    resp = requests.Response()
+    resp.status_code = status
+    return requests.HTTPError(f"{status} Server Error", response=resp)
+
+
+def test_a_mid_page_503_heals_and_resumes_where_it_stopped(tmp_path, monkeypatch):
+    # simcoe/guelph: page 2 answers 503 (or 500), the same page answers a
+    # minute later. The pull resumes past the last OID it holds, not from zero.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 4)
+    seen = []
+    script = iter([_page(1, 2), _http_error(503), _page(3, 4), _page()])
+
+    def _query(session, url, params):
+        seen.append(params["where"])
+        got = next(script)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    monkeypatch.setattr(arcgis, "_query", _query)
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 4
+    assert seen == ["OBJECTID > -1", "OBJECTID > 2", "OBJECTID > 2", "OBJECTID > 4"]
+
+
+def test_an_arcgis_error_body_under_200_heals(tmp_path, monkeypatch):
+    # kingston "Error invoking service", milton "Wait time ... has expired".
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
+    script = iter([arcgis.ArcgisError(500, "Error invoking service"), _page(1, 2), _page()])
+
+    def _query(session, url, params):
+        got = next(script)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    monkeypatch.setattr(arcgis, "_query", _query)
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 2
+
+
+def test_a_stopped_service_fails_at_once(tmp_path, monkeypatch):
+    # west-parry-sound: a 500 that says the service is not started does not
+    # clear in minutes; waiting it out only lengthens the run.
+    calls = []
+
+    def _meta(session, url):
+        calls.append(1)
+        raise arcgis.ArcgisError(500, "Service wpsgnPublic/wpsgn_opendata/MapServer not started ")
+
+    monkeypatch.setattr(arcgis, "_layer_meta", _meta)
+    with pytest.raises(ValueError, match="not started"):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert len(calls) == 1
+
+
+def test_a_client_error_is_not_a_flake(tmp_path, monkeypatch):
+    calls = []
+
+    def _meta(session, url):
+        calls.append(1)
+        raise _http_error(404)
+
+    monkeypatch.setattr(arcgis, "_layer_meta", _meta)
+    with pytest.raises(requests.HTTPError):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert len(calls) == 1
+
+
+def test_the_flake_budget_is_bounded_and_shared(tmp_path, monkeypatch):
+    # One budget per fetch: the metadata call spends some, pages get the rest.
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
+    metas = iter([_http_error(502), META])
+
+    def _meta(session, url):
+        got = next(metas)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    calls = []
+
+    def _query(session, url, params):
+        calls.append(1)
+        raise _http_error(503)
+
+    monkeypatch.setattr(arcgis, "_layer_meta", _meta)
+    monkeypatch.setattr(arcgis, "_query", _query)
+    with pytest.raises(requests.HTTPError):
+        arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert len(calls) == len(arcgis.FLAKE_WAITS)  # 1 spent on metadata, +1 final try
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_flakes_do_not_spend_the_connection_budget(tmp_path, monkeypatch):
+    # The long tier (15 min waits) is for a connection that will not open; a
+    # server that answered badly must not use it up.
+    monkeypatch.setattr(arcgis, "RETRIES", 0)
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
+    script = iter([_http_error(500), _http_error(500), _page(1, 2), _page()])
+
+    def _query(session, url, params):
+        got = next(script)
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    monkeypatch.setattr(arcgis, "_query", _query)
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 2
+
+
+def test_an_empty_first_page_gets_a_second_look(tmp_path, monkeypatch):
+    # cambridge, three days: an empty first page, a full layer minutes later.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
+    pages = iter([_page(), _page(1, 2), _page()])
+    monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 2
+
+
+def test_a_broken_read_and_an_html_body_are_flakes():
+    assert arcgis.is_flake(requests.exceptions.ChunkedEncodingError("IncompleteRead"))
+    assert arcgis.is_flake(requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0))
+    assert not arcgis.is_flake(arcgis.ArcgisError(400, "Invalid URL"))
+    assert not arcgis.is_flake(ValueError("something else"))
+
+
+def test_a_count_that_keeps_flaking_falls_back_to_unverified(tmp_path, monkeypatch):
+    # Before the short tier, a count probe that errored left the pull unchecked.
+    # Spending the budget on it must not turn that into a failed city.
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    pages = iter([_page(1, 2), _page()])
+
+    def _query(session, url, params):
+        if params.get("returnCountOnly"):
+            raise arcgis.ArcgisError(500, "Error performing query operation")
+        return next(pages)
+
+    monkeypatch.setattr(arcgis, "_query", _query)
+    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 2
