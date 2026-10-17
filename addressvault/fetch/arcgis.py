@@ -149,6 +149,19 @@ def _esri_to_geojson(esri):
     return feats
 
 
+def _oid_field(meta):
+    """The layer's object-id field. A MapServer layer may omit objectIdField and
+    only mark the field by type: middlesex's Base_Layers/MapServer/1 has its OID
+    in OBJECTID_1 and a plain OBJECTID column beside it (7,260 zeros), and paging
+    on that one stopped at 28,637 of 34,308 rows."""
+    if meta.get("objectIdField"):
+        return meta["objectIdField"]
+    for f in meta.get("fields") or []:
+        if f.get("type") == "esriFieldTypeOID":
+            return f["name"]
+    return "OBJECTID"
+
+
 def _max_oid(batch, oid_field):
     return max(f["properties"][oid_field] for f in batch)
 
@@ -228,7 +241,7 @@ def fetch(source, dest_dir, *, force=False, today=None):
     page = min(meta.get("maxRecordCount") or DEFAULT_PAGE, DEFAULT_PAGE)
     can_geojson = "geoJSON" in (meta.get("supportedQueryFormats") or "")
     fmt = "geojson" if can_geojson else "json"
-    oid_field = meta.get("objectIdField") or "OBJECTID"
+    oid_field = _oid_field(meta)
     print(f"  querying {source.slug} (page={page}, f={fmt}, oid={oid_field}"
           f"{f', expect={expected:,}' if expected is not None else ''})")
 

@@ -373,3 +373,30 @@ def test_a_count_that_keeps_flaking_falls_back_to_unverified(tmp_path, monkeypat
     monkeypatch.setattr(arcgis, "_query", _query)
     _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 2
+
+
+def test_oid_field_comes_from_the_field_type_when_the_layer_omits_it(tmp_path, monkeypatch):
+    # middlesex's MapServer layer: no objectIdField, the OID is OBJECTID_1, and a
+    # plain OBJECTID column (mostly 0) sits beside it. Paging on OBJECTID dropped rows.
+    meta = {"maxRecordCount": 2, "supportedQueryFormats": "JSON,geoJSON",
+            "fields": [{"name": "OBJECTID_1", "type": "esriFieldTypeOID"},
+                       {"name": "OBJECTID", "type": "esriFieldTypeInteger"}]}
+    rows = [{"OBJECTID_1": i, "OBJECTID": 0} for i in (1, 2, 3)]
+    seen = []
+
+    def _query(session, url, params):
+        seen.append(params["where"])
+        last = int(params["where"].split(">")[1])
+        batch = [r for r in rows if r["OBJECTID_1"] > last][:2]
+        return {"features": [{"type": "Feature", "properties": r,
+                              "geometry": {"type": "Point", "coordinates": [0.0, 0.0]}}
+                             for r in batch]}
+
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: meta)
+    monkeypatch.setattr(arcgis, "_query", _query)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 3)
+
+    path, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+
+    assert count == 3
+    assert seen[0].startswith("OBJECTID_1 >")
