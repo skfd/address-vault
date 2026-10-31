@@ -184,6 +184,32 @@ def test_dataset_gone_from_viewer_fails_loudly(tmp_path, monkeypatch):
         slims.fetch(_src(), str(tmp_path), today="2026-10-31")
 
 
+def test_get_retries_5xx_but_not_4xx(monkeypatch):
+    import requests
+    monkeypatch.setattr(slims, "RETRY_WAITS", (0, 0, 0))
+
+    class _S:
+        def __init__(self, codes):
+            self.codes = list(codes)
+            self.calls = 0
+
+        def get(self, url, **kw):
+            self.calls += 1
+            r = requests.Response()
+            r.status_code = self.codes.pop(0)
+            r.url = url
+            return r
+
+    s = _S([503, 500, 200])
+    monkeypatch.setattr(slims.requests, "Session", lambda: s)  # the retry's fresh Session
+    assert slims._get(s, "http://x/1.geobuf").status_code == 200
+    assert s.calls == 3
+    s = _S([404, 200])
+    with pytest.raises(requests.HTTPError):
+        slims._get(s, "http://x/1.geobuf")
+    assert s.calls == 1  # withdrawn is final, not a flake
+
+
 def test_preload_parses_the_js_literal():
     ds = slims.preload_datasets(PRELOAD)
     assert sorted(ds) == [83040, 85360]

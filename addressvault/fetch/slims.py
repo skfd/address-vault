@@ -46,9 +46,11 @@ The join is the fragile half: a parcels export that arrives short blanks
 not use it (number + roll + geometry), so a collapsed join reads as a mass
 "full/street changed" day the flag pipeline holds, not a re-key -- and the
 pull refuses outright when the join rate falls under ``JOIN_FLOOR``: measured
-100.0% in both cities on 2026-10-31, so anything near the floor is damage, not
-data. There is no independent row count on this route; the vault's 2%
-feature-count flag is the only truncation guard for the civic export itself.
+2026-10-31 at 100.0% for Lanark and 86.3% for Timmins (every roll found its
+parcel, but 2,703 Timmins parcels publish no location), so anything near the
+floor is damage, not data. There is no independent row count on this route;
+the vault's 2% feature-count flag is the only truncation guard for the civic
+export itself.
 """
 
 import json
@@ -105,16 +107,26 @@ def parse_url(data_url):
 
 
 def _get(session, url):
-    """GET ``url`` with the short retry tier; returns the Response."""
+    """GET ``url`` with the short retry tier; returns the Response. A 5xx or a
+    dropped connection is retried; a 4xx (dataset withdrawn) fails at once."""
     for attempt in range(RETRIES + 1):
         try:
             r = session.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
-            if r.status_code in _FLAKE_STATUS and attempt < RETRIES:
+            if r.status_code in _FLAKE_STATUS:
                 raise requests.HTTPError(f"{r.status_code} from {url}", response=r)
             r.raise_for_status()
             return r
+        except requests.HTTPError as e:
+            if e.response is None or e.response.status_code not in _FLAKE_STATUS:
+                raise
+            if attempt == RETRIES:
+                raise
+            wait = RETRY_WAITS[attempt]
+            print(f"  {url.rsplit('/', 1)[-1]}: {e}; retrying in {wait}s")
+            time.sleep(wait)
+            session = requests.Session()
         except (requests.ConnectionError, requests.Timeout,
-                requests.exceptions.ChunkedEncodingError, requests.HTTPError) as e:
+                requests.exceptions.ChunkedEncodingError) as e:
             net.wait_for_link(wait=False)
             if attempt == RETRIES:
                 raise
@@ -319,7 +331,8 @@ def fetch(source, dest_dir, *, force=False, today=None):
         if rate < JOIN_FLOOR:
             raise DegradedPull(f"parcel join collapsed: {joined:,} of {rows:,} civic "
                                f"rows found a location ({rate:.1%}, floor "
-                               f"{JOIN_FLOOR:.0%}, 100% on 2026-10-31)")
+                               f"{JOIN_FLOOR:.0%}; lanark 100% / timmins 86% "
+                               f"on 2026-10-31)")
     else:
         print(f"  {rows:,} civic rows, {len(features):,} points (no parcel join)")
 
