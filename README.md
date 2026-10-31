@@ -306,7 +306,8 @@ waiting, since their scheduled tasks carry a hard `ExecutionTimeLimit`.
 Python 3.11+.
 
 ```
-pip install -e .            # or .[shapefile] for pyshp/pyproj-backed sources
+pip install -e .            # or .[shapefile] for pyshp/pyproj-backed sources,
+                            # .[slims] (geobuf) for CGIS SLIMS Viewer sources
 pytest                      # restic lifecycle test is skipped if restic is absent
 ```
 

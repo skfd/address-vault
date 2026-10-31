@@ -11,6 +11,7 @@ dependencies = ["requests", "ijson"]
 
 [project.optional-dependencies]
 shapefile = ["pyshp", "pyproj"]
+slims = ["geobuf"]  # CGIS SLIMS Viewer exports (fetch/slims.py); pulls in protobuf
 dev = ["pytest"]
 
 [project.scripts]

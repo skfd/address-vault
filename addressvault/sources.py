@@ -13,7 +13,7 @@ import tomllib
 from dataclasses import dataclass, field
 
 _REQUIRED = ("slug", "provider", "data_url", "access", "format")
-_VALID_ACCESS = ("arcgis", "static")
+_VALID_ACCESS = ("arcgis", "static", "slims")
 _VALID_FORMAT = ("geojson", "shapefile")
 
 
