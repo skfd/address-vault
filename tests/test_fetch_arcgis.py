@@ -400,3 +400,18 @@ def test_oid_field_comes_from_the_field_type_when_the_layer_omits_it(tmp_path, m
 
     assert count == 3
     assert seen[0].startswith("OBJECTID_1 >")
+
+
+def test_the_layers_last_edit_is_recorded_where_it_reports_one(tmp_path, monkeypatch):
+    meta = dict(META, editingInfo={"lastEditDate": 1762500960000})
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: meta)
+    _one_page(monkeypatch)
+    _, _, headers, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert headers == {"last_modified": "2025-11-07T07:36:00+00:00"}
+
+
+def test_a_layer_without_a_last_edit_records_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
+    _one_page(monkeypatch)
+    _, _, headers, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert headers == {}

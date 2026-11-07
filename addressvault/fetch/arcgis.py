@@ -8,6 +8,7 @@ from the start every page.
 import os
 import time
 from datetime import date as _date
+from datetime import datetime, timezone
 
 import requests
 
@@ -162,6 +163,21 @@ def _oid_field(meta):
     return "OBJECTID"
 
 
+def _last_edit(meta):
+    """When the layer says its data or schema last changed, as UTC ISO, or None.
+
+    Recorded, not acted on. 78% of arcgis days hash identical to the day before,
+    and 39 of the 78 layers report ``editingInfo.lastEditDate`` (none of the big
+    daily-changing ones: york, ottawa, simcoe and brampton are MapServers without
+    it) -- so it could one day skip those downloads outright. Whether the field
+    can be trusted to move whenever the bytes do is a question for the history
+    this builds up beside each day's sha256, not something to take on faith."""
+    ms = (meta.get("editingInfo") or {}).get("lastEditDate")
+    if not isinstance(ms, (int, float)):
+        return None
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+
 def _max_oid(batch, oid_field):
     return max(f["properties"][oid_field] for f in batch)
 
@@ -299,4 +315,6 @@ def fetch(source, dest_dir, *, force=False, today=None):
         check_geometry(out.missing, out.count)
         # Pages went to <path>.tmp as they arrived; a refusal above discards it.
         out.commit()
-    return filepath, out.count, {}, out.reduction
+    last_edit = _last_edit(meta)
+    return (filepath, out.count, {"last_modified": last_edit} if last_edit else {},
+            out.reduction)

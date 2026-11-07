@@ -2,8 +2,9 @@
 
 All paths write ``<dest_dir>/<slug>-DATE.geojson`` (WGS84) and return
 ``(filepath, features, headers, reduction)``. ``headers`` carries the source's
-Last-Modified/Content-Length (empty for arcgis; the dataset's ``updated_at``
-and the export's byte size for slims) so the Vault can record them.
+Last-Modified/Content-Length (for arcgis, the layer's ``lastEditDate`` where
+it reports one; the dataset's ``updated_at`` and the export's byte size for
+slims) so the Vault can record them.
 ``reduction`` is the snapshot's ``sketch.Reduction``, taken in the same pass
 that wrote or scanned the file, or None when the static path reused the
 previous file unread. ``prev`` (the previous snapshot's headers, feature count
