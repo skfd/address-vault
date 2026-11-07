@@ -63,6 +63,7 @@ from urllib.parse import parse_qs, urlsplit
 import requests
 
 from addressvault import net
+from addressvault.fetch.collection import CollectionWriter
 from addressvault.fetch.degraded import (
     DegradedPull, check_geometry, has_coords)
 
@@ -343,8 +344,7 @@ def fetch(source, dest_dir, *, force=False, today=None):
                          "precision or CRS changed")
     check_geometry(sum(1 for f in features if not has_coords(f)), len(features))
 
-    tmp = filepath + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"type": "FeatureCollection", "features": features}, f)
-    os.replace(tmp, filepath)  # atomic: a reader never sees a partial file
-    return filepath, len(features), headers
+    with CollectionWriter(filepath) as out:
+        out.write(features)
+        out.commit()
+    return filepath, out.count, headers

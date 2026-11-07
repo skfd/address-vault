@@ -186,13 +186,10 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
     if source.format == "shapefile":
         shp = _locate(work, "*.shp")
         print(f"  reading shapefile {os.path.basename(shp)}")
-        features = _read_shapefile(shp, source.source_crs)
-        tmp = filepath + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"type": "FeatureCollection", "features": features}, f)
-        os.replace(tmp, filepath)  # atomic
-        count = len(features)
-        missing = sum(1 for f in features if not has_coords(f))
+        with CollectionWriter(filepath) as out:
+            out.write(_read_shapefile(shp, source.source_crs))
+            out.commit()
+        count, missing = out.count, out.missing
     else:  # geojson -- already WGS84; move it into place without parsing whole
         if is_zip:
             try:

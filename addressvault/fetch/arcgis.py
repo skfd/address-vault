@@ -5,7 +5,6 @@ indexed range scan (fast on large layers), unlike resultOffset which re-scans
 from the start every page.
 """
 
-import json
 import os
 import time
 from datetime import date as _date
@@ -13,6 +12,7 @@ from datetime import date as _date
 import requests
 
 from addressvault import net
+from addressvault.fetch.collection import CollectionWriter
 from addressvault.fetch.degraded import (  # noqa: F401  (DegradedPull re-exported)
     DegradedPull, check_geometry, has_coords)
 
@@ -245,61 +245,58 @@ def fetch(source, dest_dir, *, force=False, today=None):
     print(f"  querying {source.slug} (page={page}, f={fmt}, oid={oid_field}"
           f"{f', expect={expected:,}' if expected is not None else ''})")
 
-    features = []
-    last_oid = -1
-    while True:
-        params = {
-            "where": f"{oid_field} > {last_oid}", "outFields": "*",
-            "outSR": 4326, "f": fmt,
-            "orderByFields": oid_field, "resultRecordCount": page,
-        }
-        try:
-            data = _query(session, source.data_url, params)
-            batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
-            # An empty page only terminates once we hold rows. No address layer
-            # is legitimately empty, so an empty *first* page is the source
-            # failing in some way the error check above did not catch -- fail
-            # loudly instead of recording today as a city with no addresses.
-            # (cambridge did this on three days and answered fully minutes later,
-            # so it gets the short tier before it fails.)
-            if not batch and not features:
-                raise EmptyFirstPage("first page returned no features")
-        except (requests.ConnectionError, requests.Timeout) as e:
-            _pause(e, f"stalled at {len(features):,} features; "
-                      f"resuming past {oid_field} {last_oid}")
-            continue
-        except Exception as e:
-            _flake(e, f"{source.slug} page past {oid_field} {last_oid} "
-                      f"({len(features):,} held)")
-            continue
-        if not batch:
-            break
-        features.extend(batch)
-        last_oid = _max_oid(batch, oid_field)
-        print(f"\r  fetched {len(features):,} features ...", end="", flush=True)
-        if len(batch) < page:
-            break
-    print()
+    with CollectionWriter(filepath) as out:
+        last_oid = -1
+        while True:
+            params = {
+                "where": f"{oid_field} > {last_oid}", "outFields": "*",
+                "outSR": 4326, "f": fmt,
+                "orderByFields": oid_field, "resultRecordCount": page,
+            }
+            try:
+                data = _query(session, source.data_url, params)
+                batch = data.get("features", []) if fmt == "geojson" else _esri_to_geojson(data)
+                # An empty page only terminates once we hold rows. No address layer
+                # is legitimately empty, so an empty *first* page is the source
+                # failing in some way the error check above did not catch -- fail
+                # loudly instead of recording today as a city with no addresses.
+                # (cambridge did this on three days and answered fully minutes later,
+                # so it gets the short tier before it fails.)
+                if not batch and not out.count:
+                    raise EmptyFirstPage("first page returned no features")
+            except (requests.ConnectionError, requests.Timeout) as e:
+                _pause(e, f"stalled at {out.count:,} features; "
+                          f"resuming past {oid_field} {last_oid}")
+                continue
+            except Exception as e:
+                _flake(e, f"{source.slug} page past {oid_field} {last_oid} "
+                          f"({out.count:,} held)")
+                continue
+            if not batch:
+                break
+            out.write(batch)
+            last_oid = _max_oid(batch, oid_field)
+            print(f"\r  fetched {out.count:,} features ...", end="", flush=True)
+            if len(batch) < page:
+                break
+        print()
 
-    # A pull that stopped early is indistinguishable from a complete one once
-    # written, and downstream reads it as the city losing tens of thousands of
-    # addresses overnight. Only the short side is checked: rows added while we
-    # paged are normal, and the OID window has already skipped any that landed
-    # behind us.
-    if expected is not None and len(features) < expected * (1 - COUNT_TOLERANCE):
-        raise DegradedPull(f"truncated pull: {len(features):,} features, "
-                           f"layer reports {expected:,}")
-    if expected is not None and len(features) > expected * (1 + OVERCOUNT_TOLERANCE):
-        raise DegradedPull(f"overlong pull: {len(features):,} features, "
-                           f"layer reports {expected:,}")
+        # A pull that stopped early is indistinguishable from a complete one once
+        # written, and downstream reads it as the city losing tens of thousands of
+        # addresses overnight. Only the short side is checked: rows added while we
+        # paged are normal, and the OID window has already skipped any that landed
+        # behind us.
+        if expected is not None and out.count < expected * (1 - COUNT_TOLERANCE):
+            raise DegradedPull(f"truncated pull: {out.count:,} features, "
+                               f"layer reports {expected:,}")
+        if expected is not None and out.count > expected * (1 + OVERCOUNT_TOLERANCE):
+            raise DegradedPull(f"overlong pull: {out.count:,} features, "
+                               f"layer reports {expected:,}")
 
-    # Every row can arrive, and be the wrong rows: the count check above passes
-    # a response whose geometry the server dropped on the way out (muskoka
-    # 2026-06-30, 66,512 rows and not one coordinate).
-    check_geometry(sum(1 for f in features if not has_coords(f)), len(features))
-
-    tmp = filepath + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"type": "FeatureCollection", "features": features}, f)
-    os.replace(tmp, filepath)  # atomic: a reader never sees a partial file
-    return filepath, len(features), {}
+        # Every row can arrive, and be the wrong rows: the count check above passes
+        # a response whose geometry the server dropped on the way out (muskoka
+        # 2026-06-30, 66,512 rows and not one coordinate).
+        check_geometry(out.missing, out.count)
+        # Pages went to <path>.tmp as they arrived; a refusal above discards it.
+        out.commit()
+    return filepath, out.count, {}
