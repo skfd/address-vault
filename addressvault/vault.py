@@ -317,6 +317,7 @@ class Vault:
                 features=prior["features"], bytes=prior["bytes"],
                 src_last_modified=headers.get("last_modified"),
                 src_content_length=headers.get("content_length"),
+                src_probe=headers.get("probe"),
                 on_disk=0, archived=0, restored_until=None,
                 unchanged_since=canon, fetched_at=_now(),
                 # Identical content: the canonical day's fingerprints are this
@@ -334,6 +335,7 @@ class Vault:
                 features=count, bytes=os.path.getsize(today_path),
                 src_last_modified=headers.get("last_modified"),
                 src_content_length=headers.get("content_length"),
+                src_probe=headers.get("probe"),
                 on_disk=1, archived=0, restored_until=None,
                 unchanged_since=None, fetched_at=_now(),
                 # The fetcher reduced the features as it wrote them; only a

@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS snapshots(
   src_last_modified TEXT, src_content_length INTEGER,
   on_disk INTEGER, archived INTEGER, restored_until TEXT,
   unchanged_since TEXT, fetched_at TEXT, sketch BLOB,
-  distinct_addresses INTEGER, field_names TEXT,
+  distinct_addresses INTEGER, field_names TEXT, src_probe TEXT,
   PRIMARY KEY(slug, date)
 );
 CREATE TABLE IF NOT EXISTS jobs(
@@ -88,7 +88,7 @@ _SNAP_COLS = (
     "slug", "date", "sha256", "features", "bytes",
     "src_last_modified", "src_content_length",
     "on_disk", "archived", "restored_until", "unchanged_since", "fetched_at",
-    "sketch", "distinct_addresses", "field_names",
+    "sketch", "distinct_addresses", "field_names", "src_probe",
 )
 
 # Columns added to `snapshots` after the first vaults were built. SCHEMA above
@@ -96,7 +96,8 @@ _SNAP_COLS = (
 # agree, so a column added there needs a line here too.
 _ADDED_COLS = (("sketch", "BLOB"),
                ("distinct_addresses", "INTEGER"),
-               ("field_names", "TEXT"))
+               ("field_names", "TEXT"),
+               ("src_probe", "TEXT"))
 
 
 def _now():

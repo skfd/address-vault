@@ -407,11 +407,56 @@ def test_the_layers_last_edit_is_recorded_where_it_reports_one(tmp_path, monkeyp
     monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: meta)
     _one_page(monkeypatch)
     _, _, headers, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
-    assert headers == {"last_modified": "2025-11-07T07:36:00+00:00"}
+    assert headers["last_modified"] == "2025-11-07T07:36:00+00:00"
 
 
 def test_a_layer_without_a_last_edit_records_none(tmp_path, monkeypatch):
     monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
     _one_page(monkeypatch)
     _, _, headers, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
-    assert headers == {}
+    assert "last_modified" not in headers
+
+
+def _with_probe(monkeypatch, stat):
+    """Two features in one page; ``stat`` answers the outStatistics query."""
+    pages = iter([_page(1, 2), _page()])
+
+    def _q(session, url, params):
+        if "outStatistics" in params:
+            return stat(params)
+        return next(pages)
+    monkeypatch.setattr(arcgis, "_query", _q)
+    monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
+
+
+def test_the_probe_records_count_and_newest_edit(tmp_path, monkeypatch):
+    meta = dict(META, fields=[{"name": "MODIFIED_DATE", "type": "esriFieldTypeDate"}])
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: meta)
+    asked = []
+    _with_probe(monkeypatch, lambda p: asked.append(json.loads(p["outStatistics"]))
+                or {"features": [{"attributes": {"MAX_EDIT": 1793824622000}}]})
+    _, _, headers, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert asked[0][0]["onStatisticField"] == "MODIFIED_DATE"
+    assert json.loads(headers["probe"]) == {
+        "count": 2, "field": "MODIFIED_DATE", "max_edit": 1793824622000}
+
+
+def test_a_refused_probe_records_the_count_and_still_pulls(tmp_path, monkeypatch):
+    meta = dict(META, editFieldsInfo={"editDateField": "LAST_EDITED_DATE"})
+    monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: meta)
+
+    def _refuse(params):
+        raise arcgis.ArcgisError(400, "Unable to perform query")
+    _with_probe(monkeypatch, _refuse)
+    _, count, headers, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    assert count == 2
+    assert json.loads(headers["probe"]) == {"count": 2}
+
+
+def test_the_edit_field_is_declared_or_found_by_name():
+    date = "esriFieldTypeDate"
+    assert arcgis._edit_field({"editFieldsInfo": {"editDateField": "EDITED"}}) == "EDITED"
+    assert arcgis._edit_field({"fields": [{"name": "CREATE_DATE", "type": date},
+                                          {"name": "MODDATE", "type": date}]}) == "MODDATE"
+    assert arcgis._edit_field({"fields": [{"name": "MODEL", "type": "esriFieldTypeString"},
+                                          {"name": "CREATED_DATE", "type": date}]}) is None

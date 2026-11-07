@@ -5,7 +5,9 @@ indexed range scan (fast on large layers), unlike resultOffset which re-scans
 from the start every page.
 """
 
+import json
 import os
+import re
 import time
 from datetime import date as _date
 from datetime import datetime, timezone
@@ -178,6 +180,51 @@ def _last_edit(meta):
     return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
 
 
+def _edit_field(meta):
+    """The layer's own last-edited date column, or None.
+
+    Declared where the layer runs editor tracking (``editFieldsInfo``);
+    otherwise guessed from the date fields by name -- ottawa's
+    ``MODIFIED_DATE``, york's ``MODDATE``, waterloo-region's ``LastEditDate``."""
+    declared = (meta.get("editFieldsInfo") or {}).get("editDateField")
+    if declared:
+        return declared
+    for f in meta.get("fields") or []:
+        if (f.get("type") == "esriFieldTypeDate"
+                and re.search(r"mod|edit", f.get("name", ""), re.I)):
+            return f["name"]
+    return None
+
+
+def _probe(session, url, meta, expected):
+    """What one cheap request says about the layer before we page it: its row
+    count and the newest value in its last-edited column, as JSON, or None.
+
+    Recorded, not acted on -- like ``_last_edit``, but for the layers that do
+    not report ``lastEditDate``, ottawa among them (13 minutes a pull, unchanged
+    13 days in 30). On the days still on disk the pair moved exactly when the
+    bytes did (ottawa 6 of 6, waterloo-region 8 of 8); a few weeks of it beside
+    each day's sha256 says whether that holds before anything skips a download
+    on it. Never fails the pull: a layer that refuses the statistic records
+    the count alone."""
+    probe = {"count": expected}
+    field = _edit_field(meta)
+    if field:
+        try:
+            body = _query(session, url, {
+                "where": "1=1", "f": "json", "outStatistics": json.dumps(
+                    [{"statisticType": "max", "onStatisticField": field,
+                      "outStatisticFieldName": "max_edit"}])})
+            attrs = (body.get("features") or [{}])[0].get("attributes") or {}
+            if attrs:
+                probe.update(field=field, max_edit=next(iter(attrs.values())))
+        except Exception as e:
+            print(f"  edit probe on {field} failed ({e}); recording the count alone")
+    if probe["count"] is None and "max_edit" not in probe:
+        return None
+    return json.dumps(probe, sort_keys=True)
+
+
 def _max_oid(batch, oid_field):
     return max(f["properties"][oid_field] for f in batch)
 
@@ -254,6 +301,8 @@ def fetch(source, dest_dir, *, force=False, today=None):
                 break
             _flake(e, f"{source.slug} count probe")
 
+    probe = _probe(session, source.data_url, meta, expected)
+
     page = min(meta.get("maxRecordCount") or DEFAULT_PAGE, DEFAULT_PAGE)
     can_geojson = "geoJSON" in (meta.get("supportedQueryFormats") or "")
     fmt = "geojson" if can_geojson else "json"
@@ -315,6 +364,6 @@ def fetch(source, dest_dir, *, force=False, today=None):
         check_geometry(out.missing, out.count)
         # Pages went to <path>.tmp as they arrived; a refusal above discards it.
         out.commit()
-    last_edit = _last_edit(meta)
-    return (filepath, out.count, {"last_modified": last_edit} if last_edit else {},
+    headers = {"last_modified": _last_edit(meta), "probe": probe}
+    return (filepath, out.count, {k: v for k, v in headers.items() if v},
             out.reduction)
