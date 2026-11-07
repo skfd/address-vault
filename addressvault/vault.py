@@ -122,7 +122,11 @@ def _reduce(path, fields):
 
     One pass, three columns: the address sketch, the distinct-address count the
     sketch collapses away, and the property names the source published."""
-    r = sketch_mod.reduce_file(path, fields)
+    return _fingerprints(sketch_mod.reduce_file(path, fields))
+
+
+def _fingerprints(r):
+    """A ``sketch.Reduction`` as the three snapshot columns."""
     return {"sketch": sketch_mod.encode(r.sketch),
             "distinct_addresses": r.distinct,
             "field_names": "\n".join(r.field_names)}
@@ -285,12 +289,20 @@ class Vault:
     def _pull_locked(self, slug, src, day, force):
         latest = self.cat.latest_snapshot(slug)
         prev = None
-        if latest and latest["on_disk"]:
+        # Follow a dedup day to the file it points at. Reading the dedup row's
+        # own on_disk (always 0) turned the static HEAD check off for the day
+        # after every unchanged one: toronto re-downloaded 590 MB each Sunday
+        # it had not changed since Friday.
+        canon = latest and self.cat.get_snapshot(
+            slug, latest["unchanged_since"] or latest["date"])
+        if canon and canon["on_disk"]:
             prev = {"last_modified": latest["src_last_modified"],
                     "content_length": latest["src_content_length"],
-                    "path": config.snapshot_path(self.root, slug, latest["date"])}
+                    "features": canon["features"],
+                    "path": config.snapshot_path(self.root, slug, canon["date"])}
 
-        path, count, headers = fetch(src, self.root, prev=prev, force=force, today=day)
+        path, count, headers, reduction = fetch(src, self.root, prev=prev,
+                                                force=force, today=day)
         self.cat.set_lease_state(slug, "writing")
         sha = _sha256(path)
         today_path = config.snapshot_path(self.root, slug, day)
@@ -324,7 +336,10 @@ class Vault:
                 src_content_length=headers.get("content_length"),
                 on_disk=1, archived=0, restored_until=None,
                 unchanged_since=None, fetched_at=_now(),
-                **_reduce(today_path, src.fields),
+                # The fetcher reduced the features as it wrote them; only a
+                # path that never held them leaves the file to be re-read.
+                **(_fingerprints(reduction) if reduction
+                   else _reduce(today_path, src.fields)),
             )
         self.cat.record_job("pull", slug, day, "done")
         self.cat.set_lease_state(slug, "done")

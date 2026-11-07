@@ -51,7 +51,7 @@ def test_metadata_blip_is_retried_not_fatal(tmp_path, monkeypatch):
     monkeypatch.setattr(arcgis, "_layer_meta", _meta)
     _one_page(monkeypatch)
 
-    path, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    path, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
 
     assert count == 2
     assert json.loads(open(path).read())["features"][0]["properties"]["OBJECTID"] == 1
@@ -136,7 +136,7 @@ def test_a_layer_that_reports_no_count_is_still_pulled(tmp_path, monkeypatch):
     # Unverifiable is the guarantee we had before the probe, not a new failure.
     monkeypatch.setattr(arcgis, "_layer_meta", lambda s, u: META)
     _one_page(monkeypatch, expected=None)
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 2
 
 
@@ -147,7 +147,7 @@ def test_rows_deleted_while_paging_stay_inside_the_tolerance(tmp_path, monkeypat
     pages = iter([_page(*range(1, 298)), _page()])
     monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
     monkeypatch.setattr(arcgis, "_count", lambda s, u: 300)  # 1% of 300 == 3
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 297
 
 
@@ -195,7 +195,7 @@ def test_a_few_unlocated_addresses_are_not_a_refusal(tmp_path, monkeypatch):
     pages = iter([{"features": good}, _page()])
     monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
     monkeypatch.setattr(arcgis, "_count", lambda s, u: 199)
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 199  # 1/199 == 0.5%, inside the 1% tolerance
 
 
@@ -220,7 +220,7 @@ def test_rows_added_while_paging_stay_inside_the_overcount_tolerance(tmp_path, m
     pages = iter([_page(*range(1, 303)), _page()])
     monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
     monkeypatch.setattr(arcgis, "_count", lambda s, u: 300)  # 2% of 300 == 6
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 302
 
 
@@ -248,7 +248,7 @@ def test_a_mid_page_503_heals_and_resumes_where_it_stopped(tmp_path, monkeypatch
         return got
 
     monkeypatch.setattr(arcgis, "_query", _query)
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 4
     assert seen == ["OBJECTID > -1", "OBJECTID > 2", "OBJECTID > 2", "OBJECTID > 4"]
 
@@ -266,7 +266,7 @@ def test_an_arcgis_error_body_under_200_heals(tmp_path, monkeypatch):
         return got
 
     monkeypatch.setattr(arcgis, "_query", _query)
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 2
 
 
@@ -338,7 +338,7 @@ def test_flakes_do_not_spend_the_connection_budget(tmp_path, monkeypatch):
         return got
 
     monkeypatch.setattr(arcgis, "_query", _query)
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 2
 
 
@@ -348,7 +348,7 @@ def test_an_empty_first_page_gets_a_second_look(tmp_path, monkeypatch):
     monkeypatch.setattr(arcgis, "_count", lambda s, u: 2)
     pages = iter([_page(), _page(1, 2), _page()])
     monkeypatch.setattr(arcgis, "_query", lambda s, u, p: next(pages))
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 2
 
 
@@ -371,7 +371,7 @@ def test_a_count_that_keeps_flaking_falls_back_to_unverified(tmp_path, monkeypat
         return next(pages)
 
     monkeypatch.setattr(arcgis, "_query", _query)
-    _, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    _, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
     assert count == 2
 
 
@@ -396,7 +396,7 @@ def test_oid_field_comes_from_the_field_type_when_the_layer_omits_it(tmp_path, m
     monkeypatch.setattr(arcgis, "_query", _query)
     monkeypatch.setattr(arcgis, "_count", lambda s, u: 3)
 
-    path, count, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
+    path, count, _, _ = arcgis.fetch(_src(), str(tmp_path), today="2026-01-01")
 
     assert count == 3
     assert seen[0].startswith("OBJECTID_1 >")

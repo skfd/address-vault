@@ -89,29 +89,51 @@ class Reduction(NamedTuple):
     field_names: tuple
 
 
-def reduce_file(path, fields, k=K):
-    """Stream a snapshot once and reduce it to everything the report needs.
+class Reducer:
+    """Feed features in one at a time; ``result()`` is their ``Reduction``.
 
     Peak memory is one 64-bit hash per distinct address -- about 50 MB for the
-    largest city here, against a pull that just held the whole parsed layer.
-    That is the price of an exact ``distinct``: the bottom-k sample cannot give
-    one, since a duplicate outside the k smallest hashes is invisible to it.
+    largest city here. That is the price of an exact ``distinct``: the bottom-k
+    sample cannot give one, since a duplicate outside the k smallest hashes is
+    invisible to it.
+
+    A fetcher that already holds each feature feeds it here as it writes, so the
+    file never has to be parsed a second time: re-reading york through ijson was
+    20 s, against 5.5 s for the features in hand. Both agree hash for hash --
+    ``project`` rounds coordinates and stringifies properties, so the floats a
+    fetcher holds and the Decimals ijson reads back project identically (checked
+    against every city's newest snapshot).
     """
-    heap = []  # max-heap of negated hashes: the k smallest seen so far
-    seen, names, rows = set(), set(), 0
+
+    def __init__(self, fields, k=K):
+        self.fields, self.k = fields, k
+        self._heap = []  # max-heap of negated hashes: the k smallest seen so far
+        self._seen, self._names, self.rows = set(), set(), 0
+
+    def add(self, feat):
+        self.rows += 1
+        self._names |= (feat.get("properties") or {}).keys()
+        h = _h64(project(feat, self.fields))
+        if h in self._seen:
+            return  # same address again: the sketch is of the set
+        self._seen.add(h)
+        if len(self._heap) < self.k:
+            heapq.heappush(self._heap, -h)
+        elif h < -self._heap[0]:
+            heapq.heappushpop(self._heap, -h)
+
+    def result(self):
+        return Reduction(sorted(-x for x in self._heap), self.rows, len(self._seen),
+                         tuple(sorted(self._names)))
+
+
+def reduce_file(path, fields, k=K):
+    """Stream a snapshot once and reduce it to everything the report needs."""
+    r = Reducer(fields, k)
     with open(path, "rb") as f:
         for feat in ijson.items(f, "features.item"):
-            rows += 1
-            names |= (feat.get("properties") or {}).keys()
-            h = _h64(project(feat, fields))
-            if h in seen:
-                continue  # same address again: the sketch is of the set
-            seen.add(h)
-            if len(heap) < k:
-                heapq.heappush(heap, -h)
-            elif h < -heap[0]:
-                heapq.heappushpop(heap, -h)
-    return Reduction(sorted(-x for x in heap), rows, len(seen), tuple(sorted(names)))
+            r.add(feat)
+    return r.result()
 
 
 def of_file(path, fields, k=K):

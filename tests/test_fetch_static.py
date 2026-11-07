@@ -151,7 +151,9 @@ def _static_src(url):
 def test_scan_features_counts_rows_and_unlocated_rows_in_one_pass(tmp_path):
     path = tmp_path / "d.geojson"
     path.write_bytes(_dump(10, located=7))
-    assert static._scan_features(str(path)) == (10, 3)
+    count, missing, reduction = static._scan_features(str(path), {})
+    assert (count, missing) == (10, 3)
+    assert reduction.rows == 10
 
 
 def test_a_dump_with_no_coordinates_is_refused(tmp_path):
@@ -169,5 +171,5 @@ def test_a_dump_with_no_coordinates_is_refused(tmp_path):
 
 def test_a_dump_with_a_few_unlocated_rows_is_kept(tmp_path):
     with serve(_dump(1000, located=995), drops=0) as (url, _state):
-        _, count, _ = static.fetch(_static_src(url), str(tmp_path), today="2026-01-01")
+        _, count, _, _ = static.fetch(_static_src(url), str(tmp_path), today="2026-01-01")
     assert count == 1000  # 5/1000 == 0.5%, inside the 1% tolerance

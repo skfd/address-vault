@@ -129,7 +129,7 @@ def test_parse_url():
 def test_join_explode_and_precision(tmp_path, monkeypatch, precision):
     urls = _serve(monkeypatch, _encode(_civic(), precision), _encode(_parcels(), precision))
 
-    path, count, headers = slims.fetch(_src(), str(tmp_path), today="2026-10-31")
+    path, count, headers, _ = slims.fetch(_src(), str(tmp_path), today="2026-10-31")
 
     feats = json.load(open(path, encoding="utf-8"))["features"]
     assert count == len(feats) == 4  # three rolls, one of them two points
@@ -153,14 +153,14 @@ def test_join_explode_and_precision(tmp_path, monkeypatch, precision):
 
 def test_placeholder_location_is_null(tmp_path, monkeypatch):
     _serve(monkeypatch, _encode(_civic()), _encode(_parcels(flagged=True)))
-    path, _, _ = slims.fetch(_src(), str(tmp_path), today="2026-10-31")
+    path, _, _, _ = slims.fetch(_src(), str(tmp_path), today="2026-10-31")
     feats = json.load(open(path, encoding="utf-8"))["features"]
     assert feats[3]["properties"]["location"] is None
 
 
 def test_no_join_without_the_param(tmp_path, monkeypatch):
     urls = _serve(monkeypatch, _encode(_civic()), b"")
-    path, count, _ = slims.fetch(
+    path, count, _, _ = slims.fetch(
         _src("https://www.cgis.com/api2/public/LanarkCounty/geometry/83040.geobuf"),
         str(tmp_path), today="2026-10-31")
     feats = json.load(open(path, encoding="utf-8"))["features"]

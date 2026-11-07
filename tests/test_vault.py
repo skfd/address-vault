@@ -43,6 +43,44 @@ def test_unchanged_content_dedups(vault, http_dir):
     assert vault.path("t", "2026-01-02").endswith("t-2026-01-01.geojson")
 
 
+def test_an_unchanged_remote_is_not_downloaded_after_a_dedup_day(
+        vault, http_dir, monkeypatch):
+    # The HEAD smart-cache read the latest row's own on_disk, and a dedup day
+    # has none: the day after every unchanged one re-downloaded the whole file
+    # (toronto, 590 MB, every Sunday it had not changed since Friday).
+    from addressvault.fetch import static
+    downloads = []
+    real = static._download
+    monkeypatch.setattr(static, "_download",
+                        lambda url, dest: downloads.append(url) or real(url, dest))
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 3)
+    _add(vault, base)
+    vault.pull("t", today="2026-01-01")
+    vault.pull("t", today="2026-01-02")
+    snap3 = vault.pull("t", today="2026-01-03")
+
+    assert len(downloads) == 1
+    assert snap3.unchanged_since == "2026-01-01"
+    assert snap3.features == 3
+
+
+def test_a_pull_stores_the_fingerprints_a_reread_would(vault, http_dir):
+    # The fetcher reduces the features in the pass that scans them; what it
+    # stores must be exactly what reducing the finished file gives.
+    from addressvault import sketch
+    base, d = http_dir
+    write_geojson(d, "addr.geojson", 5)
+    vault.add_source(Source(slug="t", provider="T", data_url=f"{base}/addr.geojson",
+                            access="static", format="geojson", fields={"num": "id"}))
+    vault.pull("t", today="2026-01-01")
+    row = vault.cat.get_snapshot("t", "2026-01-01")
+    r = sketch.reduce_file(vault.path("t", "2026-01-01"), {"num": "id"})
+    assert sketch.decode(row["sketch"]) == r.sketch and len(r.sketch) == 5
+    assert row["distinct_addresses"] == r.distinct
+    assert row["field_names"].split("\n") == list(r.field_names)
+
+
 def test_changed_content_makes_new_snapshot(vault, http_dir):
     base, d = http_dir
     write_geojson(d, "addr.geojson", 3)

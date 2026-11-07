@@ -245,7 +245,7 @@ def fetch(source, dest_dir, *, force=False, today=None):
     print(f"  querying {source.slug} (page={page}, f={fmt}, oid={oid_field}"
           f"{f', expect={expected:,}' if expected is not None else ''})")
 
-    with CollectionWriter(filepath) as out:
+    with CollectionWriter(filepath, source.fields) as out:
         last_oid = -1
         while True:
             params = {
@@ -299,4 +299,4 @@ def fetch(source, dest_dir, *, force=False, today=None):
         check_geometry(out.missing, out.count)
         # Pages went to <path>.tmp as they arrived; a refusal above discards it.
         out.commit()
-    return filepath, out.count, {}
+    return filepath, out.count, {}, out.reduction

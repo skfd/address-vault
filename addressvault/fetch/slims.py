@@ -344,7 +344,7 @@ def fetch(source, dest_dir, *, force=False, today=None):
                          "precision or CRS changed")
     check_geometry(sum(1 for f in features if not has_coords(f)), len(features))
 
-    with CollectionWriter(filepath) as out:
+    with CollectionWriter(filepath, source.fields) as out:
         out.write(features)
         out.commit()
-    return filepath, out.count, headers
+    return filepath, out.count, headers, out.reduction

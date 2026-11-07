@@ -17,7 +17,7 @@ from datetime import date as _date
 import ijson
 import requests
 
-from addressvault import net
+from addressvault import net, sketch
 from addressvault.fetch.degraded import (
     DegradedPull, check_geometry, has_coords)
 
@@ -101,18 +101,21 @@ def _unzip(path, dest_dir):
         z.extractall(dest_dir)
 
 
-def _scan_features(path):
-    """``(count, missing)``: Features, and how many carry no coordinates.
+def _scan_features(path, fields):
+    """``(count, missing, reduction)``: Features, how many carry no coordinates,
+    and the snapshot's ``sketch.Reduction``.
 
-    One streaming pass for both, without loading the file into memory. The
-    geometry tally rides along on the count rather than costing a second read --
-    ijson has already built each feature by the time we tick the counter."""
-    counted = missing = 0
+    One streaming pass for all three, without loading the file into memory. The
+    tallies ride along on the parse rather than costing a read each -- ijson has
+    already built each feature by the time we tick the counter, and reading
+    toronto's 590 MB is the expensive part."""
+    missing = 0
+    reducer = sketch.Reducer(fields)
     with open(path, "rb") as f:
         for feat in ijson.items(f, "features.item"):
-            counted += 1
             missing += not has_coords(feat)
-    return counted, missing
+            reducer.add(feat)
+    return reducer.rows, missing, reducer.result()
 
 
 def _read_shapefile(shp_path, source_crs=""):
@@ -169,9 +172,13 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
         if (remote and remote.get("last_modified") == prev.get("last_modified")
                 and remote.get("content_length") == prev.get("content_length")):
             print(f"  reusing {os.path.basename(prev['path'])} (remote unchanged)")
-            count, missing = _scan_features(prev["path"])
+            if prev.get("features") is not None:
+                # The very file the vault recorded, so it passed every check
+                # then; re-parsing 590 MB to count it again proves nothing new.
+                return prev["path"], prev["features"], remote, None
+            count, missing, reduction = _scan_features(prev["path"], source.fields)
             check_geometry(missing, count)
-            return prev["path"], count, remote
+            return prev["path"], count, remote, reduction
 
     work = os.path.join(dest_dir, "_download")
     os.makedirs(work, exist_ok=True)
@@ -186,10 +193,10 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
     if source.format == "shapefile":
         shp = _locate(work, "*.shp")
         print(f"  reading shapefile {os.path.basename(shp)}")
-        with CollectionWriter(filepath) as out:
+        with CollectionWriter(filepath, source.fields) as out:
             out.write(_read_shapefile(shp, source.source_crs))
             out.commit()
-        count, missing = out.count, out.missing
+        count, missing, reduction = out.count, out.missing, out.reduction
     else:  # geojson -- already WGS84; move it into place without parsing whole
         if is_zip:
             try:
@@ -199,7 +206,7 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
         else:
             src = raw
         os.replace(src, filepath)
-        count, missing = _scan_features(filepath)
+        count, missing, reduction = _scan_features(filepath, source.fields)
 
     # A dump can arrive whole, and be an address layer with no addresses in
     # it -- every row, every field, no position. See fetch.degraded. Unlike the
@@ -215,4 +222,4 @@ def fetch(source, dest_dir, *, prev=None, force=False, today=None):
         raise
 
     print(f"  parsed {count:,} features")
-    return filepath, count, headers
+    return filepath, count, headers, reduction
