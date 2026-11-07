@@ -391,10 +391,22 @@ def _size(path):
 
 
 def _dir_bytes(path):
+    """Total size of the files under ``path``. scandir, not walk + getsize: the
+    restic repo is thousands of pack files, and on Windows a directory listing
+    already carries each size, where getsize opens every file to ask."""
     total = 0
-    for dirpath, _, filenames in os.walk(path):
-        for name in filenames:
-            total += _size(os.path.join(dirpath, name)) or 0
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return 0
+    for e in entries:
+        try:
+            if e.is_dir(follow_symlinks=False):
+                total += _dir_bytes(e.path)
+            else:
+                total += e.stat(follow_symlinks=False).st_size
+        except OSError:  # vanished mid-walk, or unreadable
+            pass
     return total
 
 

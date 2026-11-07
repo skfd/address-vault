@@ -32,6 +32,7 @@ schema change apart from a change to the data). See ``Reduction``.
 import hashlib
 import heapq
 import json
+import struct
 from typing import NamedTuple
 
 import ijson
@@ -148,8 +149,7 @@ def encode(sk):
 def decode(blob):
     if not blob:
         return []
-    return [int.from_bytes(blob[i:i + _HASH_BYTES], "big")
-            for i in range(0, len(blob), _HASH_BYTES)]
+    return list(struct.unpack(f">{len(blob) // _HASH_BYTES}Q", blob))
 
 
 def churn(a, b):
